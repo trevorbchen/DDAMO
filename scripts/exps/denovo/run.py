@@ -45,6 +45,8 @@ if __name__ == '__main__':
                                          min_add_len=config['min_add_len'])
     print(f'Time:\t\t{time() - t_start:.2f} sec')
     df = pd.DataFrame({'smiles': samples, 'qed': oracle_qed(samples), 'sa': oracle_sa(samples)})
+    df.to_csv("outputs/denovo_samples.csv", index=None)
+
     print(f'Validity:\t{len(df["smiles"]) / num_samples}')
     df = df.drop_duplicates('smiles')
     print(f'Uniqueness:\t{len(df["smiles"]) / len(samples)}')

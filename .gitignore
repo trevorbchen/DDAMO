@@ -2,6 +2,7 @@
 __pycache__/
 model.ckpt
 oracle/*
+FlashAffinity/checkpoints/*
 
 # Distribution / packaging
 .Python

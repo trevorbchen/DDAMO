@@ -44,7 +44,7 @@ def load_model_from_path(path):
 
 
 class Sampler:
-    def __init__(self, path):
+    def __init__(self, path, forward_op=None, **kwargs):
         self.model = load_model_from_path(path)
         self.slicer = Slicer()
         self.dot_index = self.model.tokenizer('.')['input_ids'][1]

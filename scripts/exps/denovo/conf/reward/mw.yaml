@@ -1,4 +1,0 @@
-# @package _global_
-reward:
-  _target_: genmol.DAPS_sampler.MolecularWeightForwardOp
-  alpha: 1.0

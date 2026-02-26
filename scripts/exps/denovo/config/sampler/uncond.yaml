@@ -1,3 +1,4 @@
 # @package _global_
+name: uncond
 sampler:
   _target_: genmol.sampler.Sampler

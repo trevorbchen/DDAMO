@@ -1,11 +1,10 @@
 defaults:
-  - sampler: standard
+  - sampler: uncond
   - reward: none
   - _self_
 
 model_path: ../../../model.ckpt
 output_dir: outputs
-output_csv: denovo_standard_samples.csv
 
 num_samples: 100
 softmax_temp: 0.8

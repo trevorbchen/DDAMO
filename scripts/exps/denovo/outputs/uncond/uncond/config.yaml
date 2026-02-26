@@ -1,3 +1,4 @@
+name: uncond
 sampler:
   _target_: genmol.sampler.Sampler
 reward:
@@ -5,9 +6,8 @@ reward:
   alpha: 0.0
   target: null
   params: {}
-model_path: model.ckpt
+model_path: ../../../model.ckpt
 output_dir: outputs
-output_csv: denovo_standard_samples.csv
 num_samples: 100
 softmax_temp: 0.8
 randomness: 0.5

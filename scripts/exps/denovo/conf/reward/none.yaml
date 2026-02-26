@@ -1,4 +1,0 @@
-# @package _global_
-reward:
-  _target_: null
-  alpha: 0.0

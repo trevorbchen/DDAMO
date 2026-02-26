@@ -37,10 +37,24 @@ def mol_weight(smiles):
 @hydra.main(version_base="1.3", config_path="config", config_name="run")
 def main(cfg: DictConfig):
     model_path = hydra.utils.to_absolute_path(cfg.model_path)
-    output_dir = hydra.utils.to_absolute_path(cfg.output_dir)
-    os.makedirs(output_dir, exist_ok=True)
+    output_base = hydra.utils.to_absolute_path(cfg.output_dir)
+    
+    # Extract sampler and reward names from config
+    sampler_name = cfg.get("name", "standard")  # Gets the 'name' field from sampler config
+    reward_name = cfg.reward.get("type", "none")
+    
+    exp_folder = os.path.join(output_base, reward_name, sampler_name)
+    os.makedirs(exp_folder, exist_ok=True)
 
-    forward_op = hydra.utils.instantiate(cfg.reward) if cfg.reward.get("_target_") else None
+    # Instantiate forward operator if target is specified and not null
+    forward_op = None
+    if cfg.reward.get("target") is not None:
+        target = cfg.reward.get("target")
+        params = cfg.reward.get("params", {})
+        # Use hydra.utils.get_class to instantiate the class
+        forward_op_class = hydra.utils.get_class(target)
+        forward_op = forward_op_class(**params)
+    
     sampler = hydra.utils.instantiate(cfg.sampler, path=model_path, forward_op=forward_op)
 
     t_start = time()
@@ -55,8 +69,16 @@ def main(cfg: DictConfig):
 
     mw = [mol_weight(smi) for smi in samples]
     df = pd.DataFrame({"smiles": samples, "mol_wt": mw})
-    out_csv = os.path.join(output_dir, cfg.output_csv)
+    
+    # Generate dynamic CSV filename
+    csv_name = f"samples.csv"
+    out_csv = os.path.join(exp_folder, csv_name)
     df.to_csv(out_csv, index=False)
+    
+    # Save config summary to the same folder
+    config_summary_path = os.path.join(exp_folder, "config.yaml")
+    with open(config_summary_path, "w") as f:
+        f.write(OmegaConf.to_yaml(cfg))
 
     valid = df["smiles"].notna().sum() / max(cfg.num_samples, 1)
     uniq = df.drop_duplicates("smiles")["smiles"].count() / max(len(samples), 1)
@@ -64,6 +86,7 @@ def main(cfg: DictConfig):
     print(OmegaConf.to_yaml(cfg))
     print(f"Time:\t\t{elapsed:.2f} sec")
     print(f"Output:\t{out_csv}")
+    print(f"Config:\t{config_summary_path}")
     print(f"Validity:\t{valid}")
     print(f"Uniqueness:\t{uniq}")
 

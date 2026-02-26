@@ -1,20 +1,24 @@
+name: daps
 sampler:
   _target_: genmol.DAPS_sampler.DAPSSampler
   num_steps: ${daps.num_steps}
-  alpha: ${reward.alpha}
+  alpha: ${daps.alpha}
   mh_steps: ${daps.mh_steps}
   max_mutations: ${daps.max_mutations}
   remask_max: ${daps.remask_max}
   remask_min: ${daps.remask_min}
   remask_schedule: ${daps.remask_schedule}
+  ode_steps: ${daps.ode_steps}
   seed: ${seed}
 daps:
-  num_steps: 20
-  mh_steps: 100
+  num_steps: 50
+  alpha: 100.0
+  mh_steps: 2
   max_mutations: 1
   remask_max: 0.6
   remask_min: 0.05
   remask_schedule: linear
+  ode_steps: 20
 reward:
   type: mw
   alpha: 1.0
@@ -22,7 +26,6 @@ reward:
   params: {}
 model_path: ../../../model.ckpt
 output_dir: outputs
-output_csv: denovo_standard_samples.csv
 num_samples: 100
 softmax_temp: 0.8
 randomness: 0.5

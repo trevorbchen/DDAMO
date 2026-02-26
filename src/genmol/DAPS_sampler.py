@@ -191,14 +191,14 @@ class DAPSSampler(Sampler):
 			cur_smiles = self._decode_keep_none(x)
 			prop_smiles = self._decode_keep_none(proposal)
 
-			cur_scores = self.forward_op(cur_smiles)
-			prop_scores = self.forward_op(prop_smiles)
+			cur_scores = self.forward_op(cur_smiles).to(x.device)
+			prop_scores = self.forward_op(prop_smiles).to(x.device)
 
 			log_ratio = self.alpha * (prop_scores - cur_scores)
 			log_ratio = torch.nan_to_num(log_ratio, nan=-1e9, neginf=-1e9, posinf=1e9)
 			accept_prob = torch.clamp(torch.exp(log_ratio), max=1.0)
-			u = torch.rand_like(accept_prob)
-			accept = (u < accept_prob).unsqueeze(-1)
+			u = torch.rand_like(accept_prob).to(x.device)
+			accept = (u < accept_prob).unsqueeze(-1).to(x.device)
 			x = torch.where(accept, proposal, x)
 
 		return x

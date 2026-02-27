@@ -1,0 +1,7 @@
+**/__pycache__/
+checkpoints/
+./scripts/eval/*.json
+FABind_plus/esm_cache/
+tmp.py
+*.pyc
+*.json

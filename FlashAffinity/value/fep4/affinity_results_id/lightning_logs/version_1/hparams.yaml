@@ -1,0 +1,42 @@
+training_args:
+  optimizer_type: adamw
+  adam_beta_1: 0.9
+  adam_beta_2: 0.95
+  adam_eps: 1.0e-08
+  lr_scheduler: cosine_restart
+  base_lr: 0
+  max_lr: 0.0001
+  warmup_steps: 50
+  weight_decay: 0.001
+  value_loss_weight: 1
+  prob_loss_weight: 1
+encoder_args:
+  protein_repr_dim: 1536
+  ligand_repr_dim: 56
+  hidden_dim: 192
+  output_dim: 192
+  num_layers: 5
+  edge_dim: 12
+  m_dim: 16
+  dropout: 0.1
+  norm_feats: true
+  norm_coors: true
+  fourier_features: 8
+  coor_weights_clamp_value: 2.0
+  num_edge_types: 10
+  attn_every: 0
+  attn_heads: 6
+  attn_dim_head: 64
+predictor_args:
+  hidden_dim: 192
+  dropout: 0.1
+loss_args:
+  alpha: 0.7
+  gamma: 1.0
+  delta: 0.5
+  group_size: 5
+compile_encoder: false
+ema: false
+ema_decay: 0.999
+use_morgan: false
+use_unimol: false

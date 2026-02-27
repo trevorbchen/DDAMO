@@ -1,0 +1,24 @@
+[2026-02-27 14:26:02] INFO: Logging to: /disk1/jyang4/repos/genmol/FlashAffinity/FABind_plus/working_dir/repr_files/protein_preprocessing.log
+[2026-02-27 14:26:02] INFO: Logging to: /disk1/jyang4/repos/genmol/FlashAffinity/FABind_plus/working_dir/repr_files/protein_preprocessing.log
+[2026-02-27 14:26:02] INFO: === Phase 1: Extracting protein structures (using 384 threads) ===
+[2026-02-27 14:26:02] INFO: === Phase 1: Extracting protein structures (using 384 threads) ===
+[2026-02-27 14:26:02] INFO: Found 0 PDB files
+[2026-02-27 14:26:02] INFO: Found 0 PDB files
+[2026-02-27 14:26:02] INFO: === Phase 2: Extracting ESM features ===
+[2026-02-27 14:26:02] INFO: === Phase 2: Extracting ESM features ===
+[2026-02-27 14:26:02] INFO: Loading all sequences to memory...
+[2026-02-27 14:26:02] INFO: Loading all sequences to memory...
+[2026-02-27 14:26:02] INFO: Total proteins available for ESM: 0 (load elapsed 0.0s)
+[2026-02-27 14:26:02] INFO: Total proteins available for ESM: 0 (load elapsed 0.0s)
+[2026-02-27 14:26:02] INFO: === Phase 3: Building final output (optimized streaming mode) ===
+[2026-02-27 14:26:02] INFO: === Phase 3: Building final output (optimized streaming mode) ===
+Starting protein structure extraction...
+Starting ESM feature extraction...
+Traceback (most recent call last):
+  File "/disk1/jyang4/repos/genmol/FlashAffinity/FABind_plus/./fabind/inference_preprocess_protein_optimized.py", line 700, in <module>
+    main()
+  File "/disk1/jyang4/repos/genmol/FlashAffinity/FABind_plus/./fabind/inference_preprocess_protein_optimized.py", line 676, in main
+    stats_final = build_final_output(structure_checkpoint, esm_checkpoint, final_output)
+  File "/disk1/jyang4/repos/genmol/FlashAffinity/FABind_plus/./fabind/inference_preprocess_protein_optimized.py", line 571, in build_final_output
+    esm_env = lmdb.open(esm_checkpoint, readonly=True, lock=False)
+lmdb.Error: /disk1/jyang4/repos/genmol/FlashAffinity/FABind_plus/working_dir/repr_files/esm_checkpoint.lmdb: No such file or directory

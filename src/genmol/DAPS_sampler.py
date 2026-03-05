@@ -414,34 +414,30 @@ class DAPSSampler(Sampler):
 	def _reverse_diffusion(self, xt, t_start):
 		"""
 		Perform reverse diffusion from noisy xt to predicted clean x0.
-		Uses iterative denoising steps similar to ODE sampling.
-		
+		Uses MDLM DDPM reverse steps from t_start down to t=0.
+
 		Args:
 			xt: Current noisy tokens
 			t_start: Starting timestep (noise level)
-			
+
 		Returns:
 			x0hat: Predicted clean tokens
 		"""
 		x = xt.clone()
-		# Create sub-timesteps for ODE solver from t_start down to 0
+		# Create sub-timesteps from t_start down to 0
 		sub_timesteps = torch.linspace(float(t_start), 0.0, self.ode_steps)
-		
+
 		for i in range(len(sub_timesteps) - 1):
 			t_cur = sub_timesteps[i]
-			t_next = sub_timesteps[i + 1]
-			
-			# Get model prediction at current timestep
+			dt = t_cur - sub_timesteps[i + 1]
+
 			attention_mask = x != self.pad_index
 			logits = self.model(x, attention_mask)
-			
-			# Use confidence-based sampling to denoise
-			# Use low temperature for deterministic denoising
-			x = self.mdlm.step_confidence(
-				logits, x, i, len(sub_timesteps) - 1,
-				0.1,  # softmax_temp - low temperature for more deterministic
-				0.1   # randomness
-			)
+
+			# MDLM DDPM reverse step using actual noise schedule
+			t_tensor = torch.full((x.shape[0],), float(t_cur), device=x.device)
+			dt_tensor = torch.full((x.shape[0],), float(dt), device=x.device)
+			x = self.mdlm.step(logits, t_tensor, x, dt_tensor, temperature=0.1)
 		return x
 
 	def _mask_fraction(self, step):
@@ -645,33 +641,33 @@ class DAPSSampler(Sampler):
 		valid_safe_proposals = 0
 		valid_smiles_proposals = 0
 		
+		# Decode current smiles once; re-decode only for accepted proposals
+		cur_smiles = self._decode_keep_none(x, debug=False)
+		cur_scores = self.forward_op(cur_smiles).to(x.device)
+
 		for _ in range(self.mh_steps):
 			proposal = self._propose_tokens(x)
-			cur_smiles = self._decode_keep_none(x, debug=False)
 			prop_smiles = self._decode_keep_none(proposal, debug=True)
-			
+
 			# If proposal SMILES are invalid, keep the original molecule
 			valid_mask = torch.tensor([s is not None for s in prop_smiles], device=x.device)
-			if valid_mask.numel() == x.size(0):
-				invalid_mask = ~valid_mask
-				if invalid_mask.any():
-					proposal = proposal.clone()
-					proposal[invalid_mask] = x[invalid_mask]
-					for idx, is_valid in enumerate(valid_mask.tolist()):
-						if not is_valid:
-							prop_smiles[idx] = cur_smiles[idx]
-			
+			invalid_mask = ~valid_mask
+			if invalid_mask.any():
+				proposal = proposal.clone()
+				proposal[invalid_mask] = x[invalid_mask]
+				for idx in invalid_mask.nonzero(as_tuple=True)[0].tolist():
+					prop_smiles[idx] = cur_smiles[idx]
+
 			# Count valid SAFE strings (proposals that could be decoded)
 			prop_safe = self._decode_safe(proposal)
 			step_total = len(prop_safe)
 			step_valid_safe = sum(s is not None and s != "" for s in prop_safe)
 			total_proposals += step_total
 			valid_safe_proposals += step_valid_safe
-			
+
 			# Track SMILES validity for debugging only
 			valid_smiles_proposals += sum(s is not None for s in prop_smiles)
 
-			cur_scores = self.forward_op(cur_smiles).to(x.device)
 			prop_scores = self.forward_op(prop_smiles).to(x.device)
 
 			log_ratio = self.alpha * (prop_scores - cur_scores)
@@ -679,14 +675,21 @@ class DAPSSampler(Sampler):
 			accept_prob = torch.clamp(torch.exp(log_ratio), max=1.0)
 			u = torch.rand_like(accept_prob).to(x.device)
 			accept = (u < accept_prob).unsqueeze(-1).to(x.device)
+			accept_flat = accept.squeeze(-1)
 			x = torch.where(accept, proposal, x)
+
+			# Update cached smiles/scores only for accepted proposals
+			if accept_flat.any():
+				for idx in accept_flat.nonzero(as_tuple=True)[0].tolist():
+					cur_smiles[idx] = prop_smiles[idx]
+				cur_scores = torch.where(accept_flat, prop_scores, cur_scores)
 
 			accept_sum += accept.float().mean().item()
 			valid_sum += step_valid_safe / max(step_total, 1)
 			reward_sum += torch.nan_to_num(prop_scores, nan=-1e9, neginf=-1e9, posinf=1e9).mean().item()
 			log_ratio_sum += log_ratio.mean().item()
 			steps += 1
-			
+
 			if pbar is not None:
 				pbar.update(1)
 		
@@ -775,37 +778,27 @@ class DAPSSampler(Sampler):
 		xt = self._insert_mask(x, num_samples, min_add_len=min_add_len)
 		xt = xt.to(self.model.device)
 
-		# Adjust progress bar based on whether we have a forward operator
-		if self.forward_op is None:
-			# No reward function: just do reverse diffusion
-			total_iterations = self.num_steps
-		else:
-			# With reward function: reverse diffusion + MH steps
-			total_iterations = self.num_steps * max(1, self.mh_steps)
-		
+		# Progress bar: each annealing step = 1 reverse diffusion + mh_steps MH iterations
+		mh_per_step = max(1, self.mh_steps) if (self.forward_op is not None and self.mh_steps > 0) else 0
+		total_iterations = self.num_steps * (1 + mh_per_step)
 		pbar = tqdm(total=total_iterations, desc="DAPS Sampling")
 
 		for i in range(self.num_steps):
 			t_current = self.timesteps[i]
-			
+
 			# Step 1: Reverse diffusion - denoise xt to get x0hat
 			x0hat = self._reverse_diffusion(xt, t_current)
-			
+			pbar.update(1)
+
 			# Visualize current molecules (only in verbose mode)
 			if self.verbose:
 				self._visualize_molecules_after_mh(x0hat)
-			
+
 			# Step 2: Metropolis-Hastings - refine x0hat using forward operator (only if reward is defined)
 			if self.forward_op is not None and self.alpha > 0 and self.mh_steps > 0:
 				x0y, mh_stats = self._mh_step(x0hat, pbar)
 			else:
 				x0y, mh_stats = x0hat, None
-				if self.forward_op is None:
-					# No reward: just update progress bar for the step
-					pbar.update(1)
-				else:
-					# Reward exists but alpha=0 or mh_steps=0: update for skipped MH steps
-					pbar.update(max(1, self.mh_steps))
 			
 			# Log progress (use SAFE for display; SMILES only for scoring)
 			safe_strings = self._decode_safe(x0y)

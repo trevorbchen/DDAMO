@@ -11,6 +11,7 @@ sampler:
   remask_schedule: ${daps.remask_schedule}
   ode_steps: ${daps.ode_steps}
   seed: ${seed}
+  verbose: ${daps.verbose}
 
 daps:
   num_steps: 50 #consider making this bigger
@@ -21,3 +22,4 @@ daps:
   remask_min: 0.05
   remask_schedule: linear
   ode_steps: 100 #20 produces very poor quality generations #number of ODE steps for reverse diffusion
+  verbose: false

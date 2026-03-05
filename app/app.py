@@ -13,13 +13,9 @@ if ROOT not in sys.path:
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-import io
 import time
-import base64
-import hashlib
 import warnings
-import functools
-from typing import List, Optional
+from typing import List
 
 import numpy as np
 import pandas as pd
@@ -232,15 +228,40 @@ def load_sampler(path: str):
 
 
 @st.cache_resource(show_spinner="Loading DAPS sampler …")
-def load_daps_sampler(path: str, forward_op_name: str, **kwargs):
-    from genmol.DAPS_sampler import DAPSSampler, MolecularWeightForwardOp
-    forward_op = MolecularWeightForwardOp() if forward_op_name == "MW" else None
+def load_daps_sampler(path: str, reward_name: str, **kwargs):
+    from genmol.DAPS_sampler import DAPSSampler
+    from genmol.rewards import get_reward
+    forward_op = get_reward(reward_name)
     return DAPSSampler(path, forward_op=forward_op, **kwargs)
 
 
 # ═══════════════════════════════════════════════════════════════════════
 # Sidebar
 # ═══════════════════════════════════════════════════════════════════════
+
+def _default_slider_ranges():
+    """Default min/max/step for each slider parameter."""
+    return {
+        "samples":      {"min": 1,    "max": 500,   "step": 5,    "default": 50},
+        "softmax_temp": {"min": 0.1,  "max": 3.0,   "step": 0.1,  "default": 1.2},
+        "randomness":   {"min": 0.0,  "max": 5.0,   "step": 0.1,  "default": 2.0},
+        "gamma":        {"min": 0.0,  "max": 1.0,   "step": 0.05, "default": 0.0},
+        "num_steps":    {"min": 5,    "max": 100,   "step": 1,    "default": 50},
+        "mh_steps":     {"min": 0,    "max": 10,    "step": 1,    "default": 2},
+        "alpha":        {"min": 0.0,  "max": 500.0, "step": 10.0, "default": 100.0},
+        "ode_steps":    {"min": 5,    "max": 200,   "step": 5,    "default": 20},
+    }
+
+
+def _get_slider_ranges():
+    """Return slider ranges, merging user overrides from session state."""
+    ranges = _default_slider_ranges()
+    overrides = st.session_state.get("slider_ranges", {})
+    for key in ranges:
+        if key in overrides:
+            ranges[key].update(overrides[key])
+    return ranges
+
 
 def render_sidebar():
     with st.sidebar:
@@ -266,6 +287,8 @@ def render_sidebar():
         st.divider()
         st.markdown("### Generation parameters")
 
+        sr = _get_slider_ranges()
+
         task = st.selectbox(
             "Task",
             ["De novo", "Fragment linking", "Fragment linking (1‑step)",
@@ -273,10 +296,18 @@ def render_sidebar():
              "Superstructure", "Mask modification"],
         )
 
-        num_samples = st.slider("Samples", 1, 500, 50, step=5)
-        softmax_temp = st.slider("Softmax temperature", 0.1, 3.0, 1.2, 0.1)
-        randomness = st.slider("Randomness", 0.0, 5.0, 2.0, 0.1)
-        gamma = st.slider("MCG γ (context guidance)", 0.0, 1.0, 0.0, 0.05)
+        num_samples = st.slider("Samples",
+            sr["samples"]["min"], sr["samples"]["max"],
+            sr["samples"]["default"], step=sr["samples"]["step"])
+        softmax_temp = st.slider("Softmax temperature",
+            sr["softmax_temp"]["min"], sr["softmax_temp"]["max"],
+            sr["softmax_temp"]["default"], sr["softmax_temp"]["step"])
+        randomness = st.slider("Randomness",
+            sr["randomness"]["min"], sr["randomness"]["max"],
+            sr["randomness"]["default"], sr["randomness"]["step"])
+        gamma = st.slider("MCG γ (context guidance)",
+            sr["gamma"]["min"], sr["gamma"]["max"],
+            sr["gamma"]["default"], sr["gamma"]["step"])
 
         fragment_input = ""
         if task not in ("De novo",):
@@ -290,11 +321,23 @@ def render_sidebar():
         if sampler_type == "DAPS":
             st.divider()
             st.markdown("### DAPS parameters")
-            daps_kwargs["num_steps"] = st.slider("Annealing steps", 5, 100, 50)
-            daps_kwargs["mh_steps"] = st.slider("MH steps / anneal step", 0, 10, 2)
-            daps_kwargs["alpha"] = st.slider("α (reward weight)", 0.0, 500.0, 100.0, 10.0)
-            daps_kwargs["ode_steps"] = st.slider("ODE sub‑steps", 5, 200, 20, 5)
-            daps_kwargs["forward_op"] = st.selectbox("Reward", ["None", "MW"])
+            daps_kwargs["reward"] = st.selectbox(
+                "Reward function",
+                ["None", "MW", "QED", "LogP", "TPSA"],
+                help="Property to optimise during MH refinement",
+            )
+            daps_kwargs["num_steps"] = st.slider("Annealing steps",
+                sr["num_steps"]["min"], sr["num_steps"]["max"],
+                sr["num_steps"]["default"], step=sr["num_steps"]["step"])
+            daps_kwargs["mh_steps"] = st.slider("MH steps / anneal step",
+                sr["mh_steps"]["min"], sr["mh_steps"]["max"],
+                sr["mh_steps"]["default"], step=sr["mh_steps"]["step"])
+            daps_kwargs["alpha"] = st.slider("α (reward weight)",
+                sr["alpha"]["min"], sr["alpha"]["max"],
+                sr["alpha"]["default"], sr["alpha"]["step"])
+            daps_kwargs["ode_steps"] = st.slider("ODE sub‑steps",
+                sr["ode_steps"]["min"], sr["ode_steps"]["max"],
+                sr["ode_steps"]["default"], sr["ode_steps"]["step"])
 
         st.divider()
         st.markdown("### Visualisation")
@@ -302,6 +345,31 @@ def render_sidebar():
             "Highlight substructure (SMARTS/SMILES)", value="",
             help="Atoms matching this pattern will be highlighted in molecule cards",
         )
+
+        # ─── Backend settings (slider ranges) ────────────────────
+        st.divider()
+        with st.expander("⚙️ Backend settings"):
+            st.caption("Set min / max limits for each parameter slider.")
+            defaults = _default_slider_ranges()
+            overrides = st.session_state.get("slider_ranges", {})
+
+            new_overrides = {}
+            for key, dflt in defaults.items():
+                label = key.replace("_", " ").title()
+                c1, c2 = st.columns(2)
+                cur_min = overrides.get(key, {}).get("min", dflt["min"])
+                cur_max = overrides.get(key, {}).get("max", dflt["max"])
+                new_min = c1.number_input(f"{label} min", value=float(cur_min),
+                                          step=float(dflt["step"]), key=f"be_{key}_min")
+                new_max = c2.number_input(f"{label} max", value=float(cur_max),
+                                          step=float(dflt["step"]), key=f"be_{key}_max")
+                if new_min != dflt["min"] or new_max != dflt["max"]:
+                    new_overrides[key] = {"min": type(dflt["min"])(new_min),
+                                          "max": type(dflt["max"])(new_max)}
+
+            if st.button("Apply ranges", key="apply_ranges"):
+                st.session_state["slider_ranges"] = new_overrides
+                st.rerun()
 
         return {
             "model_path": model_path,
@@ -321,49 +389,99 @@ def render_sidebar():
 # Generation
 # ═══════════════════════════════════════════════════════════════════════
 
-def run_generation(cfg: dict) -> List[str]:
-    """Dispatch to the appropriate sampler method and return SMILES list."""
+def _get_sampler(cfg: dict):
+    """Return the appropriate sampler instance (Standard or DAPS)."""
     path = cfg["model_path"]
-    task = cfg["task"]
-    n = cfg["num_samples"]
-    kwargs = dict(
-        softmax_temp=cfg["softmax_temp"],
-        randomness=cfg["randomness"],
-        gamma=cfg["gamma"],
-    )
-
     if cfg["sampler_type"] == "DAPS":
         dk = cfg["daps_kwargs"]
-        sampler = load_daps_sampler(
+        return load_daps_sampler(
             path,
-            forward_op_name=dk.get("forward_op", "None"),
+            reward_name=dk.get("reward", "None"),
             num_steps=dk.get("num_steps", 50),
             mh_steps=dk.get("mh_steps", 2),
             alpha=dk.get("alpha", 100.0),
             ode_steps=dk.get("ode_steps", 20),
         )
-        return sampler.de_novo_generation(n, **kwargs)
+    return load_sampler(path)
 
-    sampler = load_sampler(path)
 
-    if task == "De novo":
-        return sampler.de_novo_generation(n, **kwargs)
-    elif task == "Fragment linking":
-        return sampler.fragment_linking(cfg["fragment"], n, **kwargs)
-    elif task == "Fragment linking (1‑step)":
-        return sampler.fragment_linking_onestep(cfg["fragment"], n, **kwargs)
-    elif task in ("Motif extension", "Scaffold decoration"):
-        return sampler.fragment_completion(cfg["fragment"], n, **kwargs)
-    elif task == "Superstructure":
-        return sampler.fragment_completion(cfg["fragment"], n, apply_filter=False, **kwargs)
-    elif task == "Mask modification":
+def _convert_safe_to_smiles(safe_strings: List[str]) -> List[str]:
+    """Convert SAFE strings to SMILES (for DAPS output)."""
+    from genmol.utils.utils_chem import safe_to_smiles
+    from genmol.utils.bracket_safe_converter import bracketsafe2safe
+
+    smiles = []
+    for s in safe_strings:
+        if not s:
+            continue
+        smi = safe_to_smiles(s, fix=True)
+        if not smi:
+            try:
+                smi = safe_to_smiles(bracketsafe2safe(s), fix=True)
+            except Exception:
+                smi = None
+        if smi:
+            # Keep the largest fragment (same logic as DAPSSampler._decode)
+            smiles.append(sorted(smi.split("."), key=len)[-1])
+    return smiles
+
+
+def run_generation(cfg: dict, progress_cb=None) -> List[str]:
+    """Dispatch to the appropriate sampler method and return SMILES list.
+
+    Args:
+        progress_cb: Optional callable(fraction, status_text) for progress updates.
+    """
+    task = cfg["task"]
+    n = cfg["num_samples"]
+    frag = cfg["fragment"]
+    kwargs = dict(
+        softmax_temp=cfg["softmax_temp"],
+        randomness=cfg["randomness"],
+        gamma=cfg["gamma"],
+    )
+    sampler = _get_sampler(cfg)
+    is_daps = cfg["sampler_type"] == "DAPS"
+
+    if progress_cb:
+        progress_cb(0.0, "Loading sampler …")
+
+    if task == "Mask modification":
+        # Per-molecule loop — report progress for each
         results = []
-        for _ in range(n):
-            r = sampler.mask_modification(cfg["fragment"], **kwargs)
+        for i in range(n):
+            if progress_cb:
+                progress_cb((i / n), f"Generating molecule {i+1}/{n} …")
+            r = sampler.mask_modification(frag, **kwargs)
             if r:
                 results.append(r)
-        return results
-    return []
+    else:
+        if progress_cb:
+            progress_cb(0.05, f"Running {task} ({n} samples) …")
+
+        if task == "De novo":
+            results = sampler.de_novo_generation(n, **kwargs)
+        elif task == "Fragment linking":
+            results = sampler.fragment_linking(frag, n, **kwargs)
+        elif task == "Fragment linking (1\u2011step)":
+            results = sampler.fragment_linking_onestep(frag, n, **kwargs)
+        elif task in ("Motif extension", "Scaffold decoration"):
+            results = sampler.fragment_completion(frag, n, **kwargs)
+        elif task == "Superstructure":
+            results = sampler.fragment_completion(frag, n, apply_filter=False, **kwargs)
+        else:
+            results = []
+
+    # DAPS returns SAFE strings — convert to SMILES in the outer loop
+    if is_daps and results:
+        if progress_cb:
+            progress_cb(0.9, "Converting SAFE → SMILES …")
+        results = _convert_safe_to_smiles(results)
+
+    if progress_cb:
+        progress_cb(1.0, "Done!")
+
+    return results
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -387,17 +505,23 @@ def tab_generate(cfg):
         go_btn = st.button("⚡ Generate", type="primary", use_container_width=True)
 
     if go_btn:
-        with st.spinner("Generating …"):
-            t0 = time.time()
-            try:
-                smiles = run_generation(cfg)
-            except FileNotFoundError as e:
-                st.error(f"File not found — make sure `model.ckpt` and `data/len.pk` exist.\n\n`{e}`")
-                return
-            except Exception as e:
-                st.error(f"Generation error: {e}")
-                return
-            elapsed = time.time() - t0
+        progress_bar = st.progress(0, text="Starting …")
+        def _progress(frac, text):
+            progress_bar.progress(min(frac, 1.0), text=text)
+
+        t0 = time.time()
+        try:
+            smiles = run_generation(cfg, progress_cb=_progress)
+        except FileNotFoundError as e:
+            progress_bar.empty()
+            st.error(f"File not found — make sure `model.ckpt` and `data/len.pk` exist.\n\n`{e}`")
+            return
+        except Exception as e:
+            progress_bar.empty()
+            st.error(f"Generation error: {e}")
+            return
+        elapsed = time.time() - t0
+        progress_bar.empty()
 
         st.session_state["generated_smiles"] = smiles
         st.session_state["gen_time"] = elapsed
@@ -434,6 +558,37 @@ def tab_generate(cfg):
             f'<div class="label">{label} {sub}</div></div>',
             unsafe_allow_html=True,
         )
+
+    # ─── Save run ─────────────────────────────────────────────────
+    st.divider()
+    save_col1, save_col2 = st.columns([3, 1])
+    with save_col1:
+        gen_cfg = st.session_state.get("gen_cfg", cfg)
+        default_name = (
+            f"{gen_cfg.get('sampler_type', 'Std')}_"
+            f"{gen_cfg.get('task', 'denovo').replace(' ', '')}_"
+            f"n{n_total}"
+        )
+        run_name = st.text_input("Run name", value=default_name,
+                                 key="run_name_input",
+                                 help="Name this run to save it for comparison")
+    with save_col2:
+        st.markdown("<br/>", unsafe_allow_html=True)  # vertical alignment
+        if st.button("💾 Save run", use_container_width=True):
+            if "saved_runs" not in st.session_state:
+                st.session_state["saved_runs"] = {}
+            st.session_state["saved_runs"][run_name] = {
+                "smiles": list(smiles),
+                "cfg": {k: v for k, v in gen_cfg.items()
+                        if k != "daps_kwargs" or isinstance(v, (str, int, float, bool, dict))},
+                "time": elapsed,
+            }
+            st.success(f"Saved **{run_name}** ({n_total} molecules)")
+
+    # Show saved runs count
+    saved = st.session_state.get("saved_runs", {})
+    if saved:
+        st.caption(f"{len(saved)} saved run(s): {', '.join(saved.keys())}")
 
     st.divider()
 
@@ -737,7 +892,10 @@ def tab_evaluate(cfg):
 
 def tab_compare(cfg):
     st.markdown("### ⚖️ Compare Runs")
-    st.markdown("Upload CSV files from previous generation runs to compare them.")
+    st.markdown(
+        "Compare saved runs, uploaded CSVs, or the current session. "
+        "Save runs from the **Generate** tab using the 💾 button."
+    )
 
     uploaded = st.file_uploader(
         "Upload CSV files (must have a `smiles` column)",
@@ -745,10 +903,29 @@ def tab_compare(cfg):
         accept_multiple_files=True,
     )
 
-    # Also offer current session
+    # Gather datasets: saved runs + current session + uploaded files
     datasets = {}
+
+    # Saved runs from session
+    saved_runs = st.session_state.get("saved_runs", {})
+    if saved_runs:
+        st.markdown(f"**Saved runs** ({len(saved_runs)}):")
+        selected_runs = st.multiselect(
+            "Select saved runs to compare",
+            list(saved_runs.keys()),
+            default=list(saved_runs.keys()),
+        )
+        for name in selected_runs:
+            datasets[name] = saved_runs[name]["smiles"]
+
+        # Option to clear saved runs
+        if st.button("🗑️ Clear all saved runs", key="clear_saved"):
+            st.session_state["saved_runs"] = {}
+            st.rerun()
+
+    # Current session (only if not already saved)
     current = st.session_state.get("generated_smiles")
-    if current:
+    if current and "Current session" not in datasets:
         datasets["Current session"] = current
 
     for f in (uploaded or []):
@@ -760,7 +937,7 @@ def tab_compare(cfg):
             st.warning(f"Could not read {f.name}: {e}")
 
     if len(datasets) < 1:
-        st.info("Upload at least one CSV or generate molecules to compare.")
+        st.info("Save a run from the Generate tab, upload a CSV, or generate molecules to compare.")
         return
 
     # Build comparison table
@@ -779,10 +956,10 @@ def tab_compare(cfg):
             "Valid (%)": f"{100*n_valid/max(n_total,1):.1f}",
             "Unique (%)": f"{100*n_unique/max(n_valid,1):.1f}",
             "Diversity": f"{div:.3f}",
-            "Mean MW": f"{vdf['MW'].mean():.1f}" if len(vdf) else "—",
-            "Mean QED": f"{vdf['QED'].mean():.3f}" if len(vdf) else "—",
-            "Mean LogP": f"{vdf['LogP'].mean():.2f}" if len(vdf) else "—",
-            "Mean SA": f"{vdf['SA'].mean():.2f}" if len(vdf) else "—",
+            "Mean MW": f"{vdf['MW'].mean():.1f}" if len(vdf) and "MW" in vdf else "—",
+            "Mean QED": f"{vdf['QED'].mean():.3f}" if len(vdf) and "QED" in vdf else "—",
+            "Mean LogP": f"{vdf['LogP'].mean():.2f}" if len(vdf) and "LogP" in vdf else "—",
+            "Mean SA": f"{vdf['SA'].mean():.2f}" if len(vdf) and "SA" in vdf else "—",
         })
         all_props[name] = vdf
 
@@ -795,6 +972,8 @@ def tab_compare(cfg):
         fig = go.Figure()
         colours = px.colors.qualitative.Set2
         for i, (name, vdf) in enumerate(all_props.items()):
+            if prop not in vdf.columns or vdf[prop].dropna().empty:
+                continue
             fig.add_trace(go.Histogram(
                 x=vdf[prop].dropna(), nbinsx=30,
                 name=name, opacity=0.6,

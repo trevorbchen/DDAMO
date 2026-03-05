@@ -385,6 +385,7 @@ class DAPSSampler(Sampler):
 			remask_schedule="linear",
 			ode_steps=20,
 			seed=None,
+			verbose=False,
 			**kwargs,
 	):
 		super().__init__(path, forward_op=forward_op, **kwargs)
@@ -397,6 +398,7 @@ class DAPSSampler(Sampler):
 		self.remask_min = float(remask_min)
 		self.remask_schedule = remask_schedule
 		self.ode_steps = max(int(ode_steps), 2)
+		self.verbose = bool(verbose)
 		if seed is not None:
 			random.seed(seed)
 			torch.manual_seed(seed)
@@ -789,8 +791,9 @@ class DAPSSampler(Sampler):
 			# Step 1: Reverse diffusion - denoise xt to get x0hat
 			x0hat = self._reverse_diffusion(xt, t_current)
 			
-			# # Visualize current molecules
-			self._visualize_molecules_after_mh(x0hat)
+			# Visualize current molecules (only in verbose mode)
+			if self.verbose:
+				self._visualize_molecules_after_mh(x0hat)
 			
 			# Step 2: Metropolis-Hastings - refine x0hat using forward operator (only if reward is defined)
 			if self.forward_op is not None and self.alpha > 0 and self.mh_steps > 0:
@@ -837,61 +840,5 @@ class DAPSSampler(Sampler):
 		return self._decode_safe(xt)
 
 
-class MolecularWeightForwardOp:
-	def _smiles_error(self, smi):
-		"""Return a reason string for invalid SMILES, or None if valid."""
-		if not smi:
-			return "empty"
-		try:
-			mol = Chem.MolFromSmiles(smi)
-			if mol is not None:
-				return None
-		except Exception as exc:
-			return f"MolFromSmiles error: {exc}"
-		try:
-			mol = Chem.MolFromSmiles(smi, sanitize=False)
-			if mol is None:
-				return "MolFromSmiles returned None"
-			try:
-				Chem.SanitizeMol(mol)
-				return None
-			except Exception as exc:
-				return f"SanitizeMol error: {exc}"
-		except Exception as exc:
-			return f"MolFromSmiles(sanitize=False) error: {exc}"
-		return "unknown"
-
-	def __call__(self, smiles_list):
-		scores = []
-		invalid = []
-		for smi in smiles_list:
-			if not smi:
-				scores.append(float("-inf"))
-				invalid.append((smi, "empty"))
-				continue
-			try:
-				mol = Chem.MolFromSmiles(smi)
-				if mol is None:
-					try:
-						candidate = safe_to_smiles(bracketsafe2safe(smi), fix=True)
-						mol = Chem.MolFromSmiles(candidate) if candidate else None
-					except Exception:
-						mol = None
-				if mol is None:
-					scores.append(float("-inf"))
-					reason = self._smiles_error(smi)
-					invalid.append((smi, reason))
-					continue
-				scores.append(float(Descriptors.MolWt(mol)))
-			except Exception:
-				scores.append(float("-inf"))
-				reason = self._smiles_error(smi)
-				invalid.append((smi, reason))
-		#divide scores by 1000 to keep them in a reasonable range for exp/log operations in MH acceptance
-		# if invalid:
-		# 	print("\n[MW ForwardOp] Invalid SMILES detected:")
-		# 	for smi, reason in invalid:
-		# 		print(f"  - {smi}: {reason}")
-		scores = [s / 1000.0 for s in scores]
-
-		return torch.tensor(scores, dtype=torch.float32)
+# Backward-compat: reward classes now live in genmol.rewards
+from genmol.rewards import MolecularWeightForwardOp, get_reward  # noqa: F401

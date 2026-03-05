@@ -1,0 +1,21 @@
+name: beam_noelite_B100_N50_L8_t05
+sampler:
+  _target_: genmol.beam_search_sampler.BeamSearchSampler
+  beam_width: 50
+  branching_factor: 8
+  steps_per_interval: 4
+  elite_buffer_size: null
+  diversity_cutoff: null
+  diversity_penalty: 0.0
+reward:
+  type: none
+  alpha: 0.0
+  target: null
+  params: {}
+model_path: ../../../model.ckpt
+output_dir: outputs/sweep
+num_samples: 50
+softmax_temp: 0.5
+randomness: 0.5
+min_add_len: 40
+seed: 0

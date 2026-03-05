@@ -1,0 +1,19 @@
+name: mcts_B100_L8_c10
+sampler:
+  _target_: genmol.mcts_sampler.MCTSSampler
+  branching_factor: 8
+  steps_per_interval: 5
+  c_uct: 1.0
+  rollout_budget_per_sample: 100
+reward:
+  type: none
+  alpha: 0.0
+  target: null
+  params: {}
+model_path: ../../../model.ckpt
+output_dir: outputs/sweep
+num_samples: 50
+softmax_temp: 0.8
+randomness: 0.5
+min_add_len: 40
+seed: 0

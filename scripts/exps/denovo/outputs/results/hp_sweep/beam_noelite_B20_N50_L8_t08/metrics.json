@@ -1,0 +1,15 @@
+{
+  "elapsed_sec": 24.098488569259644,
+  "budget_per_sample": 24.0,
+  "total_reward_evals": 1200,
+  "forward_passes": 44400,
+  "fp_per_sample": 888.0,
+  "validity": 0.1,
+  "uniqueness": 1.0,
+  "qed_mean": 0.9444989328837501,
+  "qed_top10": 0.9472274236192797,
+  "qed_max": 0.9472274236192797,
+  "num_samples": 50,
+  "name": "beam_noelite_B20_N50_L8_t08",
+  "reward": "none"
+}

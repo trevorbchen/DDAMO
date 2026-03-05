@@ -1,0 +1,15 @@
+{
+  "elapsed_sec": 32.126964807510376,
+  "budget_per_sample": 20.0,
+  "total_reward_evals": 1000,
+  "forward_passes": 27000,
+  "fp_per_sample": 540.0,
+  "validity": 0.82,
+  "uniqueness": 1.0,
+  "qed_mean": 0.9382340704105353,
+  "qed_top10": 0.9475636041913926,
+  "qed_max": 0.9478961981851824,
+  "num_samples": 50,
+  "name": "beam_div01_B20_N50_L4_t08",
+  "reward": "none"
+}

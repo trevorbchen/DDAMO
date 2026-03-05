@@ -1,0 +1,15 @@
+{
+  "elapsed_sec": 327.0497856140137,
+  "budget_per_sample": 96.0,
+  "total_reward_evals": 4800,
+  "forward_passes": 98400,
+  "fp_per_sample": 1968.0,
+  "validity": 0.86,
+  "uniqueness": 1.0,
+  "qed_mean": 0.7633431140419362,
+  "qed_top10": 0.9470730365195323,
+  "qed_max": 0.947893550795942,
+  "num_samples": 50,
+  "name": "beam_B100_N20_L2_t05",
+  "reward": "none"
+}

@@ -1,0 +1,15 @@
+{
+  "elapsed_sec": 96.34744954109192,
+  "budget_per_sample": 50.0,
+  "total_reward_evals": 2500,
+  "forward_passes": 25952,
+  "fp_per_sample": 519.04,
+  "validity": 1.0,
+  "uniqueness": 1.0,
+  "qed_mean": 0.8990490878830242,
+  "qed_top10": 0.9080034724730114,
+  "qed_max": 0.9084132704005543,
+  "num_samples": 50,
+  "name": "mcts_B50_L2_c05",
+  "reward": "none"
+}

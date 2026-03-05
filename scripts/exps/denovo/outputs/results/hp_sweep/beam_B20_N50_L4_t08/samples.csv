@@ -1,0 +1,5 @@
+smiles,mol_wt
+Cc1ccsc1C(=O)NC1CCN(c2ccccn2)CC1,301.4150000000001
+Cc1ccc(-c2nc(C(=O)NC3CCOCC3)cs2)cc1,302.399
+Cc1cccc(-c2nc(C(=O)NC3CCOCC3)cs2)c1,302.39899999999994
+Cc1cccc(-c2ncc(C(=O)NC3CCOCC3)s2)c1,302.399

@@ -1,0 +1,5 @@
+smiles,mol_wt
+CN(C)c1ccc(C(=O)N[C@H]2CCOc3ccccc32)cc1,296.37
+O=C(NC[CH]c1ccccc1)N1CCN(c2ccccc2)CC1,308.4050000000001
+CCc1nc(CNC(=O)c2ccc(C(F)(F)F)cn2)cs1,315.32
+Fc1cc(N2CCNCC2)ccc1Cc1ccccc1,270.351

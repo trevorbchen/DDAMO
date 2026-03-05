@@ -1,0 +1,15 @@
+{
+  "elapsed_sec": 2.5289878845214844,
+  "budget_per_sample": 0,
+  "total_reward_evals": 0,
+  "forward_passes": 0,
+  "fp_per_sample": 0,
+  "validity": 1.0,
+  "uniqueness": 1.0,
+  "qed_mean": 0.8475209090244583,
+  "qed_top10": 0.9246627495473716,
+  "qed_max": 0.9403738184938477,
+  "num_samples": 50,
+  "name": "uncond_baseline",
+  "reward": "none"
+}

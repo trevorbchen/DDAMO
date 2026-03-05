@@ -1,0 +1,8 @@
+# @package _global_
+name: mcts
+sampler:
+  _target_: genmol.mcts_sampler.MCTSSampler
+  branching_factor: 4
+  steps_per_interval: 5
+  c_uct: 1.0
+  rollout_budget_per_sample: null

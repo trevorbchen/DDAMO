@@ -1,0 +1,10 @@
+# @package _global_
+name: beam_search
+sampler:
+  _target_: genmol.beam_search_sampler.BeamSearchSampler
+  beam_width: 4
+  branching_factor: 3
+  steps_per_interval: null  # dynamic: total_steps // 4
+  elite_buffer_size: null
+  diversity_cutoff: null
+  diversity_penalty: 0.0

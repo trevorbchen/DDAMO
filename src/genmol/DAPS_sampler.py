@@ -384,6 +384,8 @@ class DAPSSampler(Sampler):
 			remask_min=0.05,
 			remask_schedule="linear",
 			ode_steps=20,
+			mutate_strategy="infill",
+			proposal_mask_frac=0.1,
 			seed=None,
 			verbose=False,
 			**kwargs,
@@ -398,6 +400,8 @@ class DAPSSampler(Sampler):
 		self.remask_min = float(remask_min)
 		self.remask_schedule = remask_schedule
 		self.ode_steps = max(int(ode_steps), 2)
+		self.mutate_strategy = mutate_strategy  # "infill" or "fragment"
+		self.proposal_mask_frac = float(proposal_mask_frac)
 		self.verbose = bool(verbose)
 		if seed is not None:
 			random.seed(seed)
@@ -611,6 +615,40 @@ class DAPSSampler(Sampler):
 		return out
 
 	def _propose_tokens(self, x):
+		"""Propose new tokens using the configured mutate_strategy.
+
+		Strategies:
+		  "infill"   – mask a random fraction of tokens and re-fill with one
+		               model forward pass (fast, high validity).
+		  "fragment" – mutate SAFE fragments via SafeFragmentLinker
+		               (legacy, slower, lower validity).
+		"""
+		if self.mutate_strategy == "fragment":
+			return self._propose_tokens_fragment(x)
+		return self._propose_tokens_infill(x)
+
+	def _propose_tokens_infill(self, x):
+		proposal = x.clone()
+		can_mask = (
+			(x != self.pad_index)
+			& (x != self.model.bos_index)
+			& (x != self.model.eos_index)
+		)
+		rand = torch.rand_like(x, dtype=torch.float)
+		mask = (rand < self.proposal_mask_frac) & can_mask
+		proposal[mask] = self.model.mask_index
+
+		attention_mask = proposal != self.pad_index
+		logits = self.model(proposal, attention_mask)
+
+		probs = torch.softmax(logits / 0.5, dim=-1)
+		sampled = torch.multinomial(
+			probs.view(-1, probs.size(-1)), 1
+		).view(x.shape)
+		proposal[mask] = sampled[mask]
+		return proposal
+
+	def _propose_tokens_fragment(self, x):
 		x = x.clone()
 		safe_strings = self._decode_safe(x)
 		seq_len = x.shape[1]
@@ -778,9 +816,10 @@ class DAPSSampler(Sampler):
 		xt = self._insert_mask(x, num_samples, min_add_len=min_add_len)
 		xt = xt.to(self.model.device)
 
-		# Progress bar: each annealing step = 1 reverse diffusion + mh_steps MH iterations
+		# Progress bar: reverse diffusion for all steps + MH only in second half (t < 0.5)
 		mh_per_step = max(1, self.mh_steps) if (self.forward_op is not None and self.mh_steps > 0) else 0
-		total_iterations = self.num_steps * (1 + mh_per_step)
+		mh_steps_count = sum(1 for t in self.timesteps if t < 0.5)
+		total_iterations = self.num_steps + mh_steps_count * mh_per_step
 		pbar = tqdm(total=total_iterations, desc="DAPS Sampling")
 
 		for i in range(self.num_steps):
@@ -794,8 +833,16 @@ class DAPSSampler(Sampler):
 			if self.verbose:
 				self._visualize_molecules_after_mh(x0hat)
 
-			# Step 2: Metropolis-Hastings - refine x0hat using forward operator (only if reward is defined)
-			if self.forward_op is not None and self.alpha > 0 and self.mh_steps > 0:
+			# Step 2: Metropolis-Hastings - refine x0hat using forward operator
+			# Only run MH in the second half of annealing (t < 0.5) where
+			# reverse diffusion produces decodable molecules.
+			run_mh = (
+				self.forward_op is not None
+				and self.alpha > 0
+				and self.mh_steps > 0
+				and t_current < 0.5
+			)
+			if run_mh:
 				x0y, mh_stats = self._mh_step(x0hat, pbar)
 			else:
 				x0y, mh_stats = x0hat, None

@@ -16,12 +16,13 @@ import torch
 
 
 RECEPTOR_SEQUENCE = (
-    "IVGGTASVRGEWPWQVTLHTTSPTQRHLCGGSIIGNQWILTAAHCFYGVESPKILRVYSGILNQSEIKEDTSFFGVQEIIIHDQYKMAESGYDIALLKLETTVNYTDSQRPISLPSKGDRNVIYTDCWVTGWGYRKLRDKIQNTLQKAKIPLVTNEECQKRYRGHKITHKMICAGYREGGKDACKGDSGGPLSCKHNEVWHLVGITSWGEGCAQRERPGVYTNVVEYVDWILEKTQAV"
+    "MGSSHHHHHHSSGNNFNNEIKLILQQYLEKFEAHYERVLQDDQYIEALETLMDDYSEFILNPIYEQQFNAWRDVEEKAQLIKSLQYITAQCVKQVEVIRARRLLDGQASTTGYFDNIEHCIDEEFGQCSITSNDKLLLVGSGAYPMTLIQVAKETGASVIGIDIDPQAVDLGRRIVNVLAPNEDITITDQKVSELKDIKDVTHIIFSSTIPLKYSILEELYDLTNENVVVAMRFGDGIKAIFNYPSQETAEDKWQCVNKHMRPQQIFDIALYKKAAIKVGITD"
 )
 
 
-def _smiles_hash(smiles: str) -> str:
-    return hashlib.md5(smiles.encode("utf-8")).hexdigest()[:10]
+def _smiles_hash(smiles: str, receptor_seq: str = "") -> str:
+    hash_input = f"{smiles}_{receptor_seq}"
+    return hashlib.md5(hash_input.encode("utf-8")).hexdigest()[:10]
 
 
 def _write_yaml(path: Path, receptor_seq: str, ligand_smiles: str):
@@ -85,7 +86,7 @@ def run_boltz_affinity(
     # Write YAML inputs
     stems = []
     for smi in smiles_list:
-        stem = f"lig_{_smiles_hash(smi)}"
+        stem = f"lig_{_smiles_hash(smi, receptor_seq)}"
         stems.append(stem)
         yml = input_path / f"{stem}.yaml"
         if not yml.exists():

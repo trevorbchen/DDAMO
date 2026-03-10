@@ -23,6 +23,5 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
-mh_visualizations
 outputs/
-scripts/exps/denovo/outputs/results/
+mh_visualizations/

@@ -3,7 +3,7 @@ defaults:
   - reward: none
   - _self_
 
-model_path: ../../../model.ckpt
+model_path: model_v2.ckpt
 output_dir: outputs
 
 num_samples: 100

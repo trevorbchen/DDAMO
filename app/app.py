@@ -281,7 +281,7 @@ def _default_slider_ranges():
         "gamma":        {"min": 0.0,  "max": 1.0,   "step": 0.05, "default": 0.0},
         "num_steps":    {"min": 5,    "max": 100,   "step": 1,    "default": 50},
         "mh_steps":     {"min": 0,    "max": 10,    "step": 1,    "default": 2},
-        "alpha":        {"min": 0.0,  "max": 500.0, "step": 10.0, "default": 100.0},
+        "beta":         {"min": 0.0,  "max": 500.0, "step": 10.0, "default": 100.0},
         "ode_steps":    {"min": 5,    "max": 200,   "step": 5,    "default": 20},
         "beam_width":   {"min": 2,    "max": 50,    "step": 1,    "default": 8},
         "branching":    {"min": 2,    "max": 16,    "step": 1,    "default": 4},
@@ -435,10 +435,10 @@ def render_sidebar():
                 sr["mh_steps"]["min"], sr["mh_steps"]["max"],
                 sr["mh_steps"]["default"], sr["mh_steps"]["step"],
                 "daps_mh")
-            daps_kwargs["alpha"] = _synced_param("α (reward weight)",
-                sr["alpha"]["min"], sr["alpha"]["max"],
-                sr["alpha"]["default"], sr["alpha"]["step"],
-                "daps_alpha", fmt="%.1f")
+            daps_kwargs["beta"] = _synced_param("β (reward weight)",
+                sr["beta"]["min"], sr["beta"]["max"],
+                sr["beta"]["default"], sr["beta"]["step"],
+                "daps_beta", fmt="%.1f")
             daps_kwargs["ode_steps"] = _synced_param("ODE sub-steps",
                 sr["ode_steps"]["min"], sr["ode_steps"]["max"],
                 sr["ode_steps"]["default"], sr["ode_steps"]["step"],
@@ -530,9 +530,9 @@ def render_sidebar():
             )
             smc_kwargs["num_particles"] = _synced_param(
                 "Particles (K)", 2, 32, 8, 1, "smc_particles")
-            smc_kwargs["alpha"] = _synced_param(
-                "Alpha (reward weight)", 1.0, 100.0, 10.0, 1.0,
-                "smc_alpha", fmt="%.0f")
+            smc_kwargs["beta"] = _synced_param(
+                "β (reward weight)", 1.0, 100.0, 10.0, 1.0,
+                "smc_beta", fmt="%.0f")
             smc_kwargs["resample_interval"] = _synced_param(
                 "Resample interval (steps)", 1, 20, 5, 1, "smc_ri")
             smc_kwargs["resample_start"] = _synced_param(
@@ -611,7 +611,7 @@ def _auto_run_name(gen_cfg: dict, n_total: int) -> str:
             parts.append(reward.lower())
         parts.append(f"s{dk.get('num_steps', 50)}")
         parts.append(f"mh{dk.get('mh_steps', 2)}")
-        parts.append(f"a{dk.get('alpha', 100)}")
+        parts.append(f"b{dk.get('beta', 100)}")
     elif stype == "Beam Search":
         bk = gen_cfg.get("beam_kwargs", {})
         parts.append("beam")
@@ -627,6 +627,24 @@ def _auto_run_name(gen_cfg: dict, n_total: int) -> str:
         parts.append(f"L{mk.get('branching_factor', 4)}")
         parts.append(f"K{mk.get('steps_per_interval', 5)}")
         parts.append(f"c{mk.get('c_uct', 1.0)}")
+    elif stype == "DFKC":
+        fk = gen_cfg.get("dfkc_kwargs", {})
+        parts.append("dfkc")
+        reward = fk.get("reward", "None")
+        if reward and reward != "None":
+            parts.append(reward.lower())
+        parts.append(fk.get("mode", "reward"))
+        parts.append(f"K{fk.get('num_particles', 8)}")
+        parts.append(f"b{fk.get('beta', 2.0)}")
+    elif stype == "SMC":
+        sk = gen_cfg.get("smc_kwargs", {})
+        parts.append("smc")
+        reward = sk.get("reward", "None")
+        if reward and reward != "None":
+            parts.append(reward.lower())
+        parts.append(f"K{sk.get('num_particles', 8)}")
+        parts.append(f"b{sk.get('beta', 10.0)}")
+        parts.append(f"ri{sk.get('resample_interval', 5)}")
 
     temp = gen_cfg.get("softmax_temp", 1.0)
     parts.append(f"t{temp}")
@@ -634,7 +652,7 @@ def _auto_run_name(gen_cfg: dict, n_total: int) -> str:
     return "_".join(str(p) for p in parts)
 
 
-def _save_run_to_disk(run_name, smiles, gen_cfg, elapsed, props_df):
+def _save_run_to_disk(run_name, smiles, gen_cfg, elapsed, props_df, trajectory=None, budget=None):
     """Persist a run to the results directory (samples.csv + metrics.json + config.yaml)."""
     import json
     try:
@@ -662,10 +680,14 @@ def _save_run_to_disk(run_name, smiles, gen_cfg, elapsed, props_df):
 
     # Determine method name
     stype = gen_cfg.get("sampler_type", "Standard")
-    method_map = {"Standard": "uncond", "DAPS": "daps", "Beam Search": "beam", "MCTS": "mcts"}
+    method_map = {
+        "Standard": "uncond", "DAPS": "daps", "Beam Search": "beam",
+        "MCTS": "mcts", "DFKC": "dfkc", "SMC": "smc",
+    }
 
     metrics = {
         "name": run_name,
+        "sampler": method_map.get(stype, "uncond"),
         "reward": "none",
         "elapsed_sec": elapsed,
         "validity": n_valid / max(n_total, 1),
@@ -674,16 +696,16 @@ def _save_run_to_disk(run_name, smiles, gen_cfg, elapsed, props_df):
         "qed_top10": qed_top10,
         "qed_max": qed_max,
         "num_samples": n_total,
-        "budget_per_sample": 0,
-        "total_reward_evals": 0,
-        "forward_passes": 0,
-        "fp_per_sample": 0,
+        "budget_per_sample": (budget or {}).get("budget_per_sample", 0),
+        "total_reward_evals": (budget or {}).get("total_reward_evals", 0),
+        "forward_passes": (budget or {}).get("forward_passes", 0),
+        "fp_per_sample": (budget or {}).get("fp_per_sample", 0),
         "softmax_temp": gen_cfg.get("softmax_temp"),
         "randomness": gen_cfg.get("randomness"),
     }
     # Add sampler-specific params
     extra_keys = {
-        "DAPS": ("daps_kwargs", ["num_steps", "alpha", "mh_steps", "ode_steps",
+        "DAPS": ("daps_kwargs", ["num_steps", "beta", "mh_steps", "ode_steps",
                                   "mutate_strategy", "proposal_mask_frac"]),
         "Beam Search": ("beam_kwargs", ["beam_width", "branching_factor",
                                          "steps_per_interval", "diversity_penalty"]),
@@ -691,7 +713,7 @@ def _save_run_to_disk(run_name, smiles, gen_cfg, elapsed, props_df):
         "DFKC": ("dfkc_kwargs", ["num_particles", "mode", "beta", "beta_schedule",
                                   "ess_threshold"]),
         "SMC": ("smc_kwargs", ["num_particles", "resample_interval", "resample_start",
-                                "alpha", "ess_threshold"]),
+                                "beta", "ess_threshold"]),
     }
     if stype in extra_keys:
         kw_key, param_names = extra_keys[stype]
@@ -705,6 +727,11 @@ def _save_run_to_disk(run_name, smiles, gen_cfg, elapsed, props_df):
 
     with open(os.path.join(run_dir, "metrics.json"), "w") as f:
         json.dump(metrics, f, indent=2)
+
+    # trajectory.json
+    if trajectory:
+        with open(os.path.join(run_dir, "trajectory.json"), "w") as f:
+            json.dump(trajectory, f)
 
     # config.yaml
     if yaml:
@@ -744,7 +771,7 @@ def _get_sampler(cfg: dict):
             reward_name=dk.get("reward", "None"),
             num_steps=dk.get("num_steps", 50),
             mh_steps=dk.get("mh_steps", 2),
-            alpha=dk.get("alpha", 100.0),
+            beta=dk.get("beta", 100.0),
             ode_steps=dk.get("ode_steps", 20),
             mutate_strategy=dk.get("mutate_strategy", "infill"),
             proposal_mask_frac=dk.get("proposal_mask_frac", 0.1),
@@ -787,7 +814,7 @@ def _get_sampler(cfg: dict):
             num_particles=sk.get("num_particles", 8),
             resample_interval=sk.get("resample_interval", 5),
             resample_start=sk.get("resample_start", 0.5),
-            alpha=sk.get("alpha", 10.0),
+            beta=sk.get("beta", 10.0),
             ess_threshold=sk.get("ess_threshold", 0.5),
         )
     return load_sampler(path)
@@ -814,8 +841,8 @@ def _convert_safe_to_smiles(safe_strings: List[str]) -> List[str]:
     return smiles
 
 
-def run_generation(cfg: dict, progress_cb=None) -> List[str]:
-    """Dispatch to the appropriate sampler method and return SMILES list.
+def run_generation(cfg: dict, progress_cb=None) -> tuple:
+    """Dispatch to the appropriate sampler method and return (SMILES list, trajectory).
 
     Args:
         progress_cb: Optional callable(fraction, status_text) for progress updates.
@@ -870,7 +897,14 @@ def run_generation(cfg: dict, progress_cb=None) -> List[str]:
     if progress_cb:
         progress_cb(1.0, "Done!")
 
-    return results
+    trajectory = getattr(sampler, "trajectory", [])
+    budget = {
+        "budget_per_sample": getattr(sampler, "last_budget_per_sample", 0),
+        "total_reward_evals": getattr(sampler, "last_reward_evals", 0),
+        "forward_passes": getattr(sampler, "last_forward_passes", 0),
+        "fp_per_sample": getattr(sampler, "last_fp_per_sample", 0),
+    }
+    return results, trajectory, budget
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -909,7 +943,7 @@ def tab_generate(cfg):
 
         t0 = time.time()
         try:
-            smiles = run_generation(cfg, progress_cb=_progress)
+            smiles, trajectory, budget = run_generation(cfg, progress_cb=_progress)
         except FileNotFoundError as e:
             progress_bar.empty()
             st.error(f"File not found — make sure `model.ckpt` and `data/len.pk` exist.\n\n`{e}`")
@@ -924,6 +958,8 @@ def tab_generate(cfg):
         st.session_state["generated_smiles"] = smiles
         st.session_state["gen_time"] = elapsed
         st.session_state["gen_cfg"] = cfg.copy()
+        st.session_state["gen_trajectory"] = trajectory
+        st.session_state["gen_budget"] = budget
 
     # Show results if available
     smiles = st.session_state.get("generated_smiles")
@@ -978,7 +1014,9 @@ def tab_generate(cfg):
                 "time": elapsed,
             }
             # Persist to results directory so it appears in Results Explorer
-            _save_run_to_disk(run_name, smiles, gen_cfg, elapsed, df)
+            _save_run_to_disk(run_name, smiles, gen_cfg, elapsed, df,
+                              trajectory=st.session_state.get("gen_trajectory"),
+                              budget=st.session_state.get("gen_budget"))
             _load_all_metrics.clear()
 
     # Show saved runs count
@@ -1452,14 +1490,30 @@ def _load_all_metrics():
 
         m["_dir"] = root
 
-        # Infer method from name
+        # Load trajectory if available
+        traj_path = os.path.join(root, "trajectory.json")
+        if os.path.exists(traj_path):
+            try:
+                with open(traj_path) as tf:
+                    m["_trajectory"] = json.load(tf)
+            except Exception:
+                m["_trajectory"] = None
+        else:
+            m["_trajectory"] = None
+
+        # Infer method from name or sampler field
         name = m.get("name", "")
-        if name.startswith("beam"):
+        sampler_field = m.get("sampler", "")
+        if name.startswith("beam") or sampler_field == "beam_search":
             m["method"] = "Beam Search"
-        elif name.startswith("mcts"):
+        elif name.startswith("mcts") or sampler_field == "mcts":
             m["method"] = "MCTS"
-        elif name.startswith("daps"):
+        elif name.startswith("daps") or sampler_field == "daps":
             m["method"] = "DAPS"
+        elif name.startswith("dfkc") or sampler_field == "dfkc":
+            m["method"] = "DFKC"
+        elif name.startswith("smc") or sampler_field == "smc":
+            m["method"] = "SMC"
         else:
             m["method"] = "Standard"
 
@@ -1483,8 +1537,11 @@ def _load_all_metrics():
                     "beam_width", "branching_factor", "steps_per_interval",
                     "diversity_penalty", "diversity_cutoff", "elite_buffer_size",
                     "c_uct", "rollout_budget_per_sample",
-                    "num_steps", "alpha", "mh_steps", "ode_steps",
+                    "num_steps", "beta", "mh_steps", "ode_steps",
                     "mutate_strategy", "proposal_mask_frac",
+                    "num_particles", "mode", "beta_schedule",
+                    "ess_threshold", "resample_strategy",
+                    "resample_interval", "resample_start",
                 ):
                     if k in sampler_cfg and k not in m:
                         m[k] = sampler_cfg[k]
@@ -1550,8 +1607,10 @@ def tab_results(cfg):
                  "diversity_penalty", "diversity_cutoff", "elite_buffer_size"],
         "MCTS": ["c_uct", "rollout_budget_per_sample",
                  "branching_factor", "steps_per_interval"],
-        "DAPS": ["num_steps", "alpha", "mh_steps", "ode_steps",
+        "DAPS": ["num_steps", "beta", "mh_steps", "ode_steps",
                  "mutate_strategy", "proposal_mask_frac"],
+        "DFKC/SMC": ["num_particles", "mode", "beta_schedule",
+                      "ess_threshold", "resample_interval", "resample_start"],
         "General": ["softmax_temp", "randomness", "num_samples"],
     }
     # Always-on columns
@@ -1667,7 +1726,7 @@ def tab_results(cfg):
         )
 
     colours_map = {"Beam Search": "#7C3AED", "MCTS": "#22C55E", "Standard": "#F59E0B",
-                   "DFKC": "#EC4899", "SMC": "#06B6D4"}
+                   "DAPS": "#EF4444", "DFKC": "#EC4899", "SMC": "#06B6D4"}
     fig = go.Figure()
     for method in filtered["method"].unique():
         mdf = filtered[filtered["method"] == method]
@@ -1689,6 +1748,79 @@ def tab_results(cfg):
     fig.update_xaxes(gridcolor="#333")
     fig.update_yaxes(gridcolor="#333")
     st.plotly_chart(fig, use_container_width=True)
+
+    # ─── Trajectory overlay ─────────────────────────────────────
+    st.markdown("#### Best-Found vs. Budget")
+    st.caption(
+        "Overlay optimization trajectories for selected runs. "
+        "Shows how the best reward improves as compute budget is spent."
+    )
+
+    _TRAJ_COLOURS = {
+        "Beam Search": "#7C3AED",
+        "MCTS": "#22C55E",
+        "Standard": "#F59E0B",
+        "DAPS": "#EF4444",
+        "DFKC": "#EC4899",
+        "SMC": "#06B6D4",
+    }
+
+    # Filter to runs that have trajectory data
+    has_traj = filtered["_trajectory"].apply(
+        lambda x: x is not None and isinstance(x, list) and len(x) > 0
+    )
+    traj_runs = filtered[has_traj]
+    if traj_runs.empty:
+        st.info("No trajectory data available. Re-run experiments with updated samplers to generate trajectories.")
+    else:
+        traj_names = traj_runs.sort_values("qed_mean", ascending=False)["name"].tolist()
+        selected_traj = st.multiselect(
+            "Select runs to overlay",
+            traj_names,
+            default=traj_names[:min(3, len(traj_names))],
+            key="traj_overlay_select",
+        )
+
+        x_metric = st.radio(
+            "X axis", ["Reward function calls", "Model forward passes"],
+            horizontal=True, key="traj_x_axis",
+        )
+        x_key = "reward_calls" if "Reward" in x_metric else "forward_passes"
+
+        if selected_traj:
+            fig_traj = go.Figure()
+            for run_name in selected_traj:
+                row = traj_runs[traj_runs["name"] == run_name].iloc[0]
+                traj = row["_trajectory"]
+                xs = [p[x_key] for p in traj]
+                ys = [p["best_reward"] for p in traj]
+                method = row.get("method", "Unknown")
+                color = _TRAJ_COLOURS.get(method, "#888888")
+                fig_traj.add_trace(go.Scatter(
+                    x=xs, y=ys,
+                    mode="lines+markers",
+                    name=f"{run_name} ({method})",
+                    line=dict(color=color, width=2),
+                    marker=dict(size=4),
+                    hovertemplate=(
+                        f"{run_name}<br>"
+                        + x_metric + ": %{x}<br>"
+                        + "Best reward: %{y:.4f}<extra></extra>"
+                    ),
+                ))
+            fig_traj.update_layout(
+                xaxis_title=x_metric,
+                yaxis_title="Best reward found",
+                height=450,
+                paper_bgcolor="#11111B",
+                plot_bgcolor="#1E1E2E",
+                font=dict(color="#ccc"),
+                legend=dict(bgcolor="rgba(0,0,0,0)"),
+                hovermode="x unified",
+            )
+            fig_traj.update_xaxes(gridcolor="#333")
+            fig_traj.update_yaxes(gridcolor="#333")
+            st.plotly_chart(fig_traj, use_container_width=True)
 
     # ─── Load & inspect a single run ──────────────────────────────
     st.markdown("#### Inspect Run")
@@ -1744,7 +1876,7 @@ _SWEEP_PARAMS = {
     },
     "DAPS": {
         "sampler.num_steps":           {"label": "Annealing steps",        "default": "50",         "type": "int"},
-        "sampler.alpha":               {"label": "α (reward weight)",      "default": "100",        "type": "float"},
+        "sampler.beta":                {"label": "β (reward weight)",      "default": "100",        "type": "float"},
         "sampler.mh_steps":            {"label": "MH steps",               "default": "2",          "type": "int"},
         "sampler.ode_steps":           {"label": "ODE sub-steps",          "default": "20",         "type": "int"},
         "sampler.mutate_strategy":     {"label": "Proposal strategy",      "default": "infill",     "type": "choice",
@@ -1761,7 +1893,7 @@ _SWEEP_PARAMS = {
     },
     "SMC": {
         "sampler.num_particles":    {"label": "Particles (K)",         "default": "4, 8, 16",      "type": "int"},
-        "sampler.alpha":            {"label": "Alpha (reward weight)", "default": "5, 10, 20",      "type": "float"},
+        "sampler.beta":             {"label": "β (reward weight)",     "default": "5, 10, 20",      "type": "float"},
         "sampler.resample_interval":{"label": "Resample interval",     "default": "5",              "type": "int"},
         "sampler.resample_start":   {"label": "Resample start frac",   "default": "0.5",            "type": "float"},
     },
@@ -2204,7 +2336,7 @@ def tab_sweep(cfg):
                         # Infer swept params from variation in results
                         all_param_keys = [
                             "beam_width", "branching_factor", "steps_per_interval",
-                            "diversity_penalty", "c_uct", "num_steps", "alpha",
+                            "diversity_penalty", "c_uct", "num_steps", "beta",
                             "mh_steps", "ode_steps", "softmax_temp", "num_samples",
                         ]
                         _sweep_analysis(prev_dir, all_param_keys)

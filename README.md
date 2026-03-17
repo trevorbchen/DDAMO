@@ -13,29 +13,69 @@ This is the official code repository for the paper titled [GenMol: A Drug Discov
 + We propose molecular context guidance (MCG), a guidance scheme for GenMol to effectively utilize molecular context information.
 + We validate the efficacy and versatility of GenMol on a wide range of drug discovery tasks.
 
+## Web App (GenMol Studio)
+
+Interactive Streamlit app for molecule generation, evaluation, and experiment analysis.
+
+```bash
+sh run_app.sh
+```
+
+**Features:**
+- **Generate** — run any sampler (Standard, Beam Search, MCTS, DAPS, DFKC, SMC) with configurable hyperparameters
+- **Evaluate** — property distributions, chemical space PCA, scaffold analysis
+- **Compare** — overlay multiple runs side-by-side
+- **Results Explorer** — browse all saved experiments, scatter plots, **best-found vs. budget trajectories**
+- **Sweep** — launch multi-GPU hyperparameter sweeps with automatic result analysis
+
+Experiments are auto-saved to `scripts/exps/denovo/outputs/results/` and appear in the Results Explorer.
+
+## Test-Time Compute Samplers
+
+Six samplers for reward-guided de novo generation. See [scripts/exps/denovo/README.md](scripts/exps/denovo/README.md) for full parameter docs, examples, and benchmarks.
+
+| Sampler | Strategy | Key params |
+|---------|----------|------------|
+| **Standard** | Confidence-based denoising | `softmax_temp`, `randomness` |
+| **Beam Search** | Branch-prune with rollout scoring | `beam_width`, `branching_factor` |
+| **MCTS** | UCB tree search with rollout | `branching_factor`, `c_uct` |
+| **DAPS** | Annealing + Metropolis-Hastings | `num_steps`, `beta`, `mh_steps` |
+| **DFKC** | Discrete Feynman-Kac SMC ([arXiv 2601.10403](https://arxiv.org/abs/2601.10403)) | `num_particles`, `beta`, `mode` |
+| **SMC** | Vanilla particle filter with reward resampling | `num_particles`, `beta`, `resample_interval` |
+
+All samplers track per-step reward calls and model forward passes for budget analysis.
+
+---
+
 ## 🚀 News
 
 #### 2025/10/15
 We introduce GenMol V2, trained with an extended SAFE syntax, demonstrating improved performance in *de novo* and fragment-constrained generation. Please refer to the section below: [GenMol V2: GenMol with Extended SAFE Syntax](#-genmol-v2-genmol-with-extended-safe-syntax).
 
 ## Table of Contents
-- [Installation](#installation)
-- [GenMol V1](#genmol-v1)
+- [Contribution](#contribution)
+- [Web App (GenMol Studio)](#web-app-genmol-studio)
+- [Test-Time Compute Samplers](#test-time-compute-samplers)
+- [🚀 News](#-news)
+    - [2025/10/15](#20251015)
+- [Table of Contents](#table-of-contents)
+- [📦 Installation](#-installation)
+- [🔬 GenMol V1](#-genmol-v1)
   - [Training](#training)
-  - [Training with User-defined Dataset](#optional-training-with-user-defined-dataset)
+  - [(Optional) Training with User-defined Dataset](#optional-training-with-user-defined-dataset)
   - [*De Novo* Generation](#de-novo-generation)
   - [Fragment-constrained Generation](#fragment-constrained-generation)
   - [Goal-directed Hit Generation (PMO Benchmark)](#goal-directed-hit-generation-pmo-benchmark)
   - [Goal-directed Lead Optimization](#goal-directed-lead-optimization)
-- [GenMol V2: GenMol with Extended SAFE Syntax](#-genmol-v2-genmol-with-extended-safe-syntax)
-  - [Summary](#summary)
-  - [Introduction](#introduction)
+- [🚀 GenMol V2: GenMol with Extended SAFE Syntax (Angle-Brackets for Inter-Fragment Attachment Points)](#-genmol-v2-genmol-with-extended-safe-syntax-angle-brackets-for-inter-fragment-attachment-points)
+  - [Summary:](#summary)
+  - [Introduction:](#introduction)
   - [Benchmarks](#benchmarks)
   - [Training](#training-1)
   - [*De Novo* Generation](#de-novo-generation-1)
   - [Fragment-constrained Generation](#fragment-constrained-generation-1)
 - [License](#license)
-- [Citation](#citation)
+- [📝 Citation](#-citation)
 
 ## 📦 Installation
 Clone this repository:

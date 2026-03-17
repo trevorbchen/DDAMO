@@ -1,0 +1,10 @@
+# @package _global_
+name: dfkc
+sampler:
+  _target_: genmol.smc_sampler.DFKCSampler
+  num_particles: 8
+  mode: annealing
+  beta: 2.0
+  beta_schedule: linear
+  ess_threshold: 0.5
+  resample_strategy: systematic

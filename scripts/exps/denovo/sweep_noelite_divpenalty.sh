@@ -32,7 +32,7 @@ add_beam_noelite() {
     local B=$1 N=$2 L=$3 TEMP=$4
     local K=$(derive_K $B $L)
     local NAME="beam_noelite_B${B}_N${N}_L${L}_t${TEMP/./}"
-    JOBS+=("python3 run_beam_mcts.py sampler=beam_search $REWARD $N_SAMPLES $OUT \
+    JOBS+=("python3 run_generation.py sampler=beam_search $REWARD $N_SAMPLES $OUT \
         softmax_temp=$TEMP \
         sampler.steps_per_interval=$K \
         sampler.branching_factor=$L \
@@ -62,7 +62,7 @@ add_beam_diverse() {
     local K=$(derive_K $B $L)
     local LNAME=$(echo $LAMBDA | tr -d '.')
     local NAME="beam_div${LNAME}_B${B}_N${N}_L${L}_t${TEMP/./}"
-    JOBS+=("python3 run_beam_mcts.py sampler=beam_search $REWARD $N_SAMPLES $OUT \
+    JOBS+=("python3 run_generation.py sampler=beam_search $REWARD $N_SAMPLES $OUT \
         softmax_temp=$TEMP \
         sampler.steps_per_interval=$K \
         sampler.branching_factor=$L \
@@ -89,7 +89,7 @@ done
 add_mcts() {
     local B=$1 L=$2 C=$3
     local NAME="mcts_ref_B${B}_L${L}_c${C/./}"
-    JOBS+=("python3 run_beam_mcts.py sampler=mcts $REWARD $N_SAMPLES $OUT \
+    JOBS+=("python3 run_generation.py sampler=mcts $REWARD $N_SAMPLES $OUT \
         sampler.branching_factor=$L \
         sampler.c_uct=$C \
         sampler.rollout_budget_per_sample=$B \

@@ -3,7 +3,7 @@ name: daps
 sampler:
   _target_: genmol.DAPS_sampler.DAPSSampler
   num_steps: ${daps.num_steps}
-  alpha: ${daps.alpha}
+  beta: ${daps.beta}
   mh_steps: ${daps.mh_steps}
   max_mutations: ${daps.max_mutations}
   remask_max: ${daps.remask_max}
@@ -17,7 +17,7 @@ sampler:
 
 daps:
   num_steps: 50 #consider making this bigger
-  alpha: 100. #forward operator weight
+  beta: 100. #forward operator weight
   mh_steps: 2 #consider making this smaller
   max_mutations: 1
   remask_max: 0.6

@@ -1,6 +1,6 @@
 # @package _global_
 reward:
-  type: qed
+  type: tpsa
   beta: 1.0
-  target: genmol.rewards.QEDReward
+  target: genmol.rewards.TPSAReward
   params: {}

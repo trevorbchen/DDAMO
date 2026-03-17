@@ -22,7 +22,7 @@ echo "smiles,mol_wt" > "$OUTPUT_CSV"
 for i in $(seq 1 $ROUNDS); do
     echo -n "Round $i/$ROUNDS ... "
     cd "$SCRIPT_DIR"
-    $PYTHON run_beam_mcts.py $SAMPLER_ARGS num_samples=$BATCH 2>/dev/null | grep -E "^(Time|Valid|Unique)" || true
+    $PYTHON run_generation.py $SAMPLER_ARGS num_samples=$BATCH 2>/dev/null | grep -E "^(Time|Valid|Unique)" || true
     # Find the latest samples.csv for this sampler
     LATEST=$(ls -t outputs/*/*/samples.csv 2>/dev/null | head -1)
     if [ -n "$LATEST" ]; then

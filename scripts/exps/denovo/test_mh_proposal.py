@@ -253,7 +253,7 @@ def main():
         path=args.model_path,
         forward_op=forward_op,
         mh_steps=1,
-        alpha=1.0,
+        beta=1.0,
         seed=args.seed,
     )
     

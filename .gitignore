@@ -25,3 +25,4 @@ share/python-wheels/
 MANIFEST
 outputs/
 mh_visualizations/
+*.log

@@ -81,14 +81,15 @@ def multinomial_resample(log_weights):
 # ---------------------------------------------------------------------------
 
 class DFKCSampler(Sampler):
-    """Discrete Feynman-Kac Corrector for MDLM (arxiv 2601.10403).
+    """Discrete Feynman-Kac Corrector for MDLM (Hasan et al., arXiv 2601.10403).
 
-    Modes:
-      annealing - sharpen model distribution by p_t^beta. Scales logits
-                  by beta before step_confidence. Weight corrects for the
-                  distribution mismatch. No reward function needed.
-      reward    - tilt distribution toward high-reward molecules. Uses
-                  periodic reward scoring to update particle weights.
+    Implements Algorithm 1 with two modes:
+      annealing - sample from p_t^β via scaled logits (Eq 15) with
+                  Feynman-Kac weight correction (Corollary 3.2, Eq 14).
+                  No reward function needed.
+      reward    - tilt distribution toward high reward via Δβ_t·r(x)
+                  weight increments (approximation of Corollary 3.6, Eq 20;
+                  exact per-token formulation is O(V·d) per step).
                   Requires forward_op.
     """
 
@@ -97,7 +98,7 @@ class DFKCSampler(Sampler):
         path,
         forward_op=None,
         num_particles=8,
-        mode="annealing",
+        mode="reward",
         beta=2.0,
         beta_schedule="linear",
         ess_threshold=0.5,
@@ -144,10 +145,12 @@ class DFKCSampler(Sampler):
         return alpha_t.item(), d_alpha_dt.item()
 
     def _annealing_weight_increment(self, logits, x, step, num_steps, beta_t):
-        """Compute log-weight increment for annealing mode.
+        """Compute log-weight increment for annealing mode (Corollary 3.2, Eq 14).
 
-        From Corollary 3.2: g_tau compares base vs sharpened marginals
-        at masked positions, scaled by noise schedule rate.
+        g_τ(i) = δ_{mi} (∂α_t/∂t)/α_t · Σ_j [p_t(j)/p_t(m) - p_t^β(j)/p_t^β(m)]
+
+        Using Eq 72: p_t(j)/p_t(m) = α_t/(1-α_t) · p(x_0=j|x_t=m)  for j≠m
+        Sharpened:  [p_t(j)/p_t(m)]^β = [α_t/(1-α_t)]^β · p(x_0=j|x_t=m)^β
         """
         device = x.device
         alpha_t, d_alpha_dt = self._get_noise_params(step, num_steps, device)
@@ -156,19 +159,24 @@ class DFKCSampler(Sampler):
         if not mask.any():
             return torch.zeros(x.shape[0], device=device)
 
-        # Get base probabilities at masked positions
+        # p(x_0=j|x_t=m) from model output (already normalized logprobs)
         log_p_x0 = self.mdlm._subs_parameterization(logits.clone(), x)
-        probs_base = F.softmax(log_p_x0, dim=-1)          # [K, seq, V]
-        probs_sharp = F.softmax(log_p_x0 * beta_t, dim=-1)
+        p_x0 = torch.exp(log_p_x0)  # [K, seq, V]
 
-        # Difference summed over vocab at each position
-        diff = (probs_base - probs_sharp).sum(dim=-1)     # [K, seq]
-        diff = (diff * mask.float()).sum(dim=-1)           # [K]
+        # Noise schedule ratio c = α_t / (1 - α_t)
+        c = alpha_t / max(1.0 - alpha_t, 1e-8)
 
-        # Scale by noise rate (Eq 14 from paper)
+        # Per-position: Σ_j [c·s_j - c^β·s_j^β] = c·1 - c^β·Σ s_j^β
+        sum_s_beta = (p_x0 ** beta_t).sum(dim=-1)       # [K, seq]
+        per_pos = c - (c ** beta_t) * sum_s_beta         # [K, seq]
+
+        # Sum over masked positions only
+        per_pos = (per_pos * mask.float()).sum(dim=-1)    # [K]
+
+        # Scale by noise rate and dt  (Eq 14: (∂α_t/∂t)/α_t · dt)
         dt = 1.0 / num_steps
-        rate = abs(d_alpha_dt) / max(alpha_t, 1e-8)
-        g = beta_t * rate * diff * dt
+        rate = d_alpha_dt / max(alpha_t, 1e-8)           # keep sign (negative)
+        g = rate * per_pos * dt
         return g
 
     def _reward_weight_increment(self, x, step, num_steps, beta_t):
@@ -179,11 +187,13 @@ class DFKCSampler(Sampler):
         evals per step -- impractical for molecules.
         """
         if self.forward_op is None:
-            return torch.zeros(x.shape[0], device=x.device), 0
+            return torch.zeros(x.shape[0], device=x.device), 0, float("-inf")
 
         smiles = decode_smiles(self.model, x)
         rewards = self.forward_op(smiles)  # [K]
         rewards = rewards.to(x.device)
+
+        best_r = rewards[rewards.isfinite()].max().item() if rewards.isfinite().any() else float("-inf")
 
         # Clamp -inf to a large negative value for weight stability
         rewards = rewards.clamp(min=-100.0)
@@ -193,7 +203,7 @@ class DFKCSampler(Sampler):
         prev_beta = self._get_beta_t(max(step - 1, 0), num_steps)
         d_beta = beta_t - prev_beta
         g = d_beta * rewards
-        return g, len(smiles)
+        return g, len(smiles), best_r
 
     def _resample(self, x, log_weights):
         """Resample particles and reset weights."""
@@ -213,6 +223,8 @@ class DFKCSampler(Sampler):
         K = self.num_particles
         device = self.model.device
         n_rounds = math.ceil(num_samples / K)
+
+        self._reset_trajectory()
 
         all_smiles = []
         all_weights = []
@@ -243,11 +255,13 @@ class DFKCSampler(Sampler):
                 if self.mode == "annealing":
                     log_weights += self._annealing_weight_increment(
                         logits, x, i, num_steps, beta_t)
-                elif self.mode == "reward" and i > num_steps // 2:
-                    g, n_evals = self._reward_weight_increment(
+                    self._log_point(0, K, float("-inf"))
+                elif self.mode == "reward":
+                    g, n_evals, best_r = self._reward_weight_increment(
                         x, i, num_steps, beta_t)
                     log_weights += g
                     total_reward_evals += n_evals
+                    self._log_point(n_evals, K, best_r)
 
                 # Modified state update
                 if self.mode == "annealing":
@@ -303,7 +317,7 @@ class SMCSampler(Sampler):
     Propagates K particles with the unmodified MDLM denoiser. Every
     ``resample_interval`` steps (starting at ``resample_start`` fraction
     of denoising), decodes particles to SMILES, scores them with
-    ``forward_op``, and resamples proportional to exp(alpha * reward).
+    ``forward_op``, and resamples proportional to exp(beta * reward).
     """
 
     def __init__(
@@ -313,7 +327,7 @@ class SMCSampler(Sampler):
         num_particles=8,
         resample_interval=5,
         resample_start=0.5,
-        alpha=10.0,
+        beta=10.0,
         ess_threshold=0.5,
         resample_strategy="systematic",
         seed=None,
@@ -325,7 +339,7 @@ class SMCSampler(Sampler):
         self.num_particles = max(int(num_particles), 2)
         self.resample_interval = max(int(resample_interval), 1)
         self.resample_start = float(resample_start)
-        self.alpha = float(alpha)
+        self.beta = float(beta)
         self.ess_threshold = float(ess_threshold)
         self.resample_strategy = resample_strategy
         self.verbose = bool(verbose)
@@ -339,6 +353,9 @@ class SMCSampler(Sampler):
         K = self.num_particles
         device = self.model.device
         n_rounds = math.ceil(num_samples / K)
+
+        self._reset_trajectory()
+        last_logged_fp = 0
 
         all_smiles = []
         all_rewards = []
@@ -375,6 +392,10 @@ class SMCSampler(Sampler):
                     rewards = self.forward_op(smiles).to(device)
                     total_reward_evals += K
 
+                    best_r = rewards[rewards.isfinite()].max().item() if rewards.isfinite().any() else float("-inf")
+                    self._log_point(K, total_fp - last_logged_fp, best_r)
+                    last_logged_fp = total_fp
+
                     # Replace -inf with minimum finite reward
                     finite = rewards.isfinite()
                     if finite.any():
@@ -382,7 +403,7 @@ class SMCSampler(Sampler):
                     else:
                         continue  # all invalid, skip resampling
 
-                    log_w = self.alpha * rewards
+                    log_w = self.beta * rewards
                     ess = compute_ess(log_w)
 
                     if ess < self.ess_threshold * K:
@@ -400,6 +421,9 @@ class SMCSampler(Sampler):
             if self.forward_op is not None:
                 rewards = self.forward_op(smiles).to(device)
                 total_reward_evals += K
+                best_r = rewards[rewards.isfinite()].max().item() if rewards.isfinite().any() else float("-inf")
+                self._log_point(K, total_fp - last_logged_fp, best_r)
+                last_logged_fp = total_fp
             else:
                 rewards = torch.zeros(K, device=device)
 

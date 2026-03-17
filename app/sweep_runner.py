@@ -1,6 +1,6 @@
 """Multi-GPU hyperparameter sweep runner.
 
-Launches ``run_beam_mcts.py`` subprocesses with round-robin GPU assignment,
+Launches ``run_generation.py`` subprocesses with round-robin GPU assignment,
 following the same pattern as ``sweep_full_hp.sh``.  No Streamlit dependency.
 """
 
@@ -38,7 +38,7 @@ _SAMPLER_PARAMS = {
         "sampler.c_uct",
     ],
     "DAPS": [
-        "sampler.num_steps", "sampler.alpha",
+        "sampler.num_steps", "sampler.beta",
         "sampler.mh_steps", "sampler.ode_steps",
     ],
     "DFKC": [
@@ -47,7 +47,7 @@ _SAMPLER_PARAMS = {
     ],
     "SMC": [
         "sampler.num_particles", "sampler.resample_interval",
-        "sampler.alpha",
+        "sampler.beta",
     ],
     "Standard": [],
 }
@@ -59,7 +59,7 @@ _SHORT = {
     "sampler.diversity_penalty": "dp",
     "sampler.c_uct": "c",
     "sampler.num_steps": "s",
-    "sampler.alpha": "a",
+    "sampler.beta": "b",
     "sampler.mh_steps": "mh",
     "sampler.ode_steps": "ode",
     "sampler.num_particles": "K",
@@ -178,7 +178,7 @@ class SweepRunner:
     def _find_metrics(self, name: str) -> str | None:
         """Find metrics.json for a run, checking both direct and reward-subdirectory paths.
 
-        run_beam_mcts.py saves to: output_dir/reward_name/run_name/metrics.json
+        run_generation.py saves to: output_dir/reward_name/run_name/metrics.json
         """
         # Direct path: sweep_dir/name/metrics.json
         direct = os.path.join(self.sweep_dir, name, "metrics.json")
@@ -199,17 +199,14 @@ class SweepRunner:
         cmd = [
             sys.executable,
             "scripts/exps/denovo/run_generation.py",
-            "--sampler", sampler_cli,
-            "--reward", self.reward,
-            "--model_path", self.model_path,
-            "--output_dir", self.sweep_dir,
-            "--name", config["name"],
+            f"sampler={sampler_cli}",
+            f"reward={self.reward}",
+            f"model_path={self.model_path}",
+            f"output_dir={self.sweep_dir}",
+            f"name={config['name']}",
         ]
         for k, v in config["overrides"].items():
-            # Convert dotted Hydra keys (sampler.beam_width) to flat CLI
-            # flags (--beam_width)
-            flag = k.split(".")[-1]
-            cmd.extend([f"--{flag}", str(v)])
+            cmd.append(f"{k}={v}")
         return cmd
 
     # ── Lifecycle ──────────────────────────────────────────────────

@@ -243,6 +243,8 @@ class MCTSSampler(Sampler):
             num_rollouts = num_samples * round(L * total_steps / K)
         iters = max(1, num_rollouts // L)
 
+        self._reset_trajectory()
+
         root = MCTSNode(x_proto, step=0)
         # UCB requires parent.V > 0; seed root so first selection doesn't hit log(0).
         root.V = 1
@@ -257,7 +259,10 @@ class MCTSSampler(Sampler):
             if node.step >= total_steps:
                 # Terminal leaf — decode is deterministic, so just backprop
                 # the same reward to update visit counts (no new forward passes).
-                all_results.extend(self._handle_terminal(node))
+                terminal_results = self._handle_terminal(node)
+                all_results.extend(terminal_results)
+                best_t = max((r for r, _ in terminal_results), default=float("-inf"))
+                self._log_point(1, 0, best_t)
             else:
                 # Unexpanded node — expand, simulate, backprop
                 results, fp = self._expand_simulate_backprop(
@@ -265,6 +270,8 @@ class MCTSSampler(Sampler):
                 )
                 all_results.extend(results)
                 total_fp += fp
+                best_r = max((r for r, _ in results), default=float("-inf"))
+                self._log_point(L, fp, best_r)
 
         # ── Collect top-N unique SMILES ───────────────────────────────────
         # Unlike beam search which keeps a fixed-width beam, MCTS accumulates

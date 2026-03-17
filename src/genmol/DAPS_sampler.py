@@ -377,7 +377,7 @@ class DAPSSampler(Sampler):
 			path,
 			forward_op=None,
 			num_steps=50,
-			alpha=100.0,
+			beta=100.0,
 			mh_steps=2,
 			max_mutations=1,
 			remask_max=0.6,
@@ -393,7 +393,7 @@ class DAPSSampler(Sampler):
 		super().__init__(path, forward_op=forward_op, **kwargs)
 		self.forward_op = forward_op #or MolecularWeightForwardOp()
 		self.num_steps = max(int(num_steps), 1)
-		self.alpha = float(alpha)
+		self.beta = float(beta)
 		self.mh_steps = max(int(mh_steps), 0)
 		self.max_mutations = max(int(max_mutations), 1)
 		self.remask_max = float(remask_max)
@@ -708,7 +708,7 @@ class DAPSSampler(Sampler):
 
 			prop_scores = self.forward_op(prop_smiles).to(x.device)
 
-			log_ratio = self.alpha * (prop_scores - cur_scores)
+			log_ratio = self.beta * (prop_scores - cur_scores)
 			log_ratio = torch.nan_to_num(log_ratio, nan=-1e9, neginf=-1e9, posinf=1e9)
 			accept_prob = torch.clamp(torch.exp(log_ratio), max=1.0)
 			u = torch.rand_like(accept_prob).to(x.device)
@@ -816,6 +816,8 @@ class DAPSSampler(Sampler):
 		xt = self._insert_mask(x, num_samples, min_add_len=min_add_len)
 		xt = xt.to(self.model.device)
 
+		self._reset_trajectory()
+
 		# Progress bar: reverse diffusion for all steps + MH only in second half (t < 0.5)
 		mh_per_step = max(1, self.mh_steps) if (self.forward_op is not None and self.mh_steps > 0) else 0
 		mh_steps_count = sum(1 for t in self.timesteps if t < 0.5)
@@ -838,7 +840,7 @@ class DAPSSampler(Sampler):
 			# reverse diffusion produces decodable molecules.
 			run_mh = (
 				self.forward_op is not None
-				and self.alpha > 0
+				and self.beta > 0
 				and self.mh_steps > 0
 				and t_current < 0.5
 			)
@@ -849,11 +851,23 @@ class DAPSSampler(Sampler):
 			
 			# Log progress (use SAFE for display; SMILES only for scoring)
 			safe_strings = self._decode_safe(x0y)
+
+			# Count budget for this annealing step
+			fp_this_step = (self.ode_steps - 1) * num_samples  # _reverse_diffusion
+			re_this_step = 0
+			if run_mh:
+				# MH: 1 initial scoring + mh_steps proposal scorings
+				re_this_step += num_samples * (1 + self.mh_steps)
+				if self.mutate_strategy == "infill":
+					fp_this_step += self.mh_steps * num_samples
+
 			if self.forward_op is not None:
 				smiles = self._decode(x0y)
 				scores = self.forward_op(smiles)
+				re_this_step += num_samples  # this scoring call
 				mean_score = scores.mean().item()
-				postfix = {"Mean Score": f"{mean_score:.2f}"} #"Step": i + 1, #"t": f"{t_current:.3f}"
+				self._log_point(re_this_step, fp_this_step, scores.max().item())
+				postfix = {"Mean Score": f"{mean_score:.2f}"}
 				if mh_stats is not None:
 					postfix.update({
 						"MH acc": f"{mh_stats['accept']:.2f}",
@@ -863,6 +877,7 @@ class DAPSSampler(Sampler):
 					})
 				pbar.set_postfix(postfix)
 			else:
+				self._log_point(0, fp_this_step, float("-inf"))
 				pbar.set_postfix({"Step": i + 1, "t": f"{t_current:.3f}"})
 			
 			# Step 3: Forward diffusion - add noise for next iteration
@@ -877,6 +892,12 @@ class DAPSSampler(Sampler):
 				xt = x0y
 
 		pbar.close()
+
+		self.last_forward_passes = self._cumul_forward_passes
+		self.last_fp_per_sample = self._cumul_forward_passes / max(num_samples, 1)
+		self.last_reward_evals = self._cumul_reward_calls
+		self.last_budget_per_sample = self._cumul_reward_calls / max(num_samples, 1)
+
 		return self._decode_safe(xt)
 
 

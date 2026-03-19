@@ -1,0 +1,50 @@
+name: fa_comparison_v1
+
+# ── 3 Axes (cartesian product) ───────────────────────────────────────
+# Axis 1: inference-time sampler
+samplers: [beam_search, mcts, smc, dfkc, daps, uncond]
+
+# Axis 2: finetune method applied to GenMol before inference
+# "none" = base pretrained model, "ddpp" = DDPP-finetuned
+finetune: [none]
+
+# Axis 3: guide reward (used during generation to steer the sampler)
+guide_rewards: [flash_affinity]
+
+# ── Oracle evaluation (applied after generation) ─────────────────────
+oracle: flash_affinity
+oracle_params:
+  protein_id: "2VT4"
+  task: value
+
+# ── Generation params ────────────────────────────────────────────────
+model_path: model_v2.ckpt
+num_samples: 100
+seed: 0
+softmax_temp: 1.0
+randomness: 0.3
+min_add_len: 60
+
+# ── Per-sampler budget/HP overrides ──────────────────────────────────
+sampler_overrides:
+  beam_search:
+    beam_width: 8
+    branching_factor: 4
+  mcts:
+    branching_factor: 4
+    c_uct: 1.0
+  smc:
+    num_particles: 16
+    beta: 10.0
+  dfkc:
+    num_particles: 16
+    beta: 2.0
+  daps:
+    num_steps: 50
+    mh_steps: 2
+
+# ── DDPP checkpoint (required if finetune includes ddpp) ─────────────
+ddpp_checkpoint: null
+
+# ── Output ───────────────────────────────────────────────────────────
+output_dir: outputs/comparison

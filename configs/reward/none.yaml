@@ -1,0 +1,5 @@
+# @package _global_
+reward:
+  type: none
+  target: null
+  params: {}

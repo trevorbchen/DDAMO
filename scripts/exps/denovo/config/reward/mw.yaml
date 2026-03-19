@@ -1,6 +1,0 @@
-# @package _global_
-reward:
-  type: mw
-  beta: 1.0
-  target: genmol.DAPS_sampler.MolecularWeightForwardOp
-  params: {}

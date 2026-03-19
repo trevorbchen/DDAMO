@@ -1,0 +1,39 @@
+# DDPP-LB fine-tuning config
+# Usage: python scripts/exps/denovo/run_ddpp.py reward=qed beta=0.25
+
+model_path: model_v2.ckpt
+output_dir: outputs/ddpp
+
+# reward
+reward: qed
+beta: 1.0            # inverse temperature: smaller β = stronger reward guidance
+
+# training
+num_steps: 5000
+lr: 1e-4              # learning rate for fine-tuned denoiser
+lr_logz: 1e-3         # learning rate for log-Z network
+batch_size: 16
+warmup_logz_steps: 500  # steps where only log-Z is trained (denoiser frozen)
+ema_decay: 0.9999
+sampling_eps: 1e-3
+
+# replay buffer
+replay_buffer_size: 10000
+initial_buffer_from_pretrained: 64
+refill_interval: 250   # add on-policy samples every N steps
+refill_batch_size: 16
+
+# generation params (shared with standard sampler)
+softmax_temp: 0.8
+randomness: 0.5
+min_add_len: 60
+seed: 0
+
+# evaluation
+num_eval_samples: 100
+verbose: false
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null

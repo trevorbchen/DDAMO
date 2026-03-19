@@ -13,26 +13,123 @@ This is the official code repository for the paper titled [GenMol: A Drug Discov
 + We propose molecular context guidance (MCG), a guidance scheme for GenMol to effectively utilize molecular context information.
 + We validate the efficacy and versatility of GenMol on a wide range of drug discovery tasks.
 
+## Design Space
+
+This codebase supports systematic comparison across three axes for reward-guided molecule generation:
+
+| Axis | What it controls | Current options |
+|------|-----------------|-----------------|
+| **Inference-time sampler** | How the model explores during generation | Standard, Beam Search, MCTS, DAPS, DFKC, SMC |
+| **Finetune method** | What you do to GenMol before inference | None (base), DDPP |
+| **Reward function** | What guides generation / evaluates quality | QED, LogP, MW, TPSA, FlashAffinity, Boltz |
+
+The goal: find the best combination under a fixed compute budget for generating molecules with high binding affinity.
+
+### Reward: Guide vs Oracle
+
+Rewards serve two distinct roles:
+
+- **Guide reward** — used *during* generation to steer the sampler. Must be cheap enough to call hundreds of times. Examples: QED (~0ms/mol), FlashAffinity (~100ms/mol).
+- **Oracle reward** — used *after* generation to evaluate the final molecules. Can be expensive. Examples: FlashAffinity, Boltz (~3s/mol).
+
+The guide and oracle can differ. For example, generate with FlashAffinity as guide, then evaluate with Boltz as oracle to get a more accurate affinity estimate.
+
+### FlashAffinity: Folder vs Pipeline
+
+| | `FlashAffinity/` folder scripts | `src/genmol/rewards/flash_affinity.py` |
+|---|---|---|
+| **Interface** | Shell scripts, reads/writes files | Python callable: SMILES in, tensor out |
+| **Protein data** | Preprocessed each run via `preprocess_proteins.sh` | Loaded once at init, reused |
+| **Ligand 3D** | Can use FABind+ docking | RDKit conformer (faster, slightly less accurate) |
+| **Use case** | Standalone evaluation (oracle) | Embedded in sampler loop (guide reward) |
+
+For oracle evaluation after generation, use `evals/flash_affinity.py` which wraps the pipeline version.
+
+### Running a Comparison
+
+`scripts/comparison.py` orchestrates controlled comparisons across any subset of the three axes:
+
+```bash
+# Compare all samplers with FlashAffinity guide, base model
+python scripts/comparison.py --config configs/comparison/example.yaml
+```
+
+Example config:
+```yaml
+name: sampler_comparison
+samplers: [beam_search, mcts, smc, dfkc, daps, uncond]
+finetunes: [none]
+guide_rewards: [flash_affinity]
+oracle: flash_affinity
+num_samples: 100
+```
+
+Each combo runs generation with the guide reward, then oracle evaluation. Output:
+```
+outputs/comparison/<name>/
+├── none/flash_affinity/beam_search/   (samples.csv, metrics.json, oracle_scores.csv)
+├── none/flash_affinity/mcts/
+├── ...
+└── summary.csv   ← all combos side-by-side
+```
+
+Budget is controlled per-sampler (reward call count + wall-clock time are both tracked).
+
+## Codebase Structure
+
+```
+src/genmol/                  # Library — importable, no side effects
+├── model.py                 # GenMol MDLM model (never changes)
+├── model_loader.py          # Checkpoint merging (base + finetune)
+├── samplers/                # Axis 1: inference-time algorithms
+│   ├── base.py              # Sampler base class, load_model_from_path()
+│   ├── beam_search.py       # BeamSearchSampler, EliteBuffer
+│   ├── mcts.py              # MCTSSampler, MCTSNode
+│   ├── smc.py               # SMCSampler, DFKCSampler
+│   └── daps.py              # DAPSSampler (annealing + MH mutations)
+├── rewards/                 # Axis 3: reward functions
+│   ├── __init__.py          # REWARD_REGISTRY, get_reward() factory
+│   ├── properties.py        # QED, LogP, MW, TPSA reward classes
+│   ├── flash_affinity.py    # FlashAffinityForwardOp (neural binding affinity)
+│   └── boltz.py             # BoltzAffinityReward (structure-based)
+├── finetune/                # Axis 2: finetuning algorithms
+│   └── ddpp.py              # DDPPLBTrainer, LogZNetwork, ReplayBuffer
+└── utils/                   # Shared utilities
+
+scripts/                     # Entry points — thin CLI wrappers
+├── run.py                   # Single experiment (sampler × reward × finetune)
+├── comparison.py            # Multi-combo comparison across axes
+├── collect_results.py       # Aggregate outputs/ into summary CSV
+├── training/
+│   ├── train.py             # Pretrain GenMol from scratch
+│   └── train_ddpp.py        # DDPP finetuning
+└── benchmarks/              # Paper benchmarks (PMO, lead opt, frag)
+
+evals/                       # Post-generation evaluation
+├── metrics.py               # Validity, QED, SA, MW, H-bond metrics + CLI
+├── flash_affinity.py        # FlashAffinity oracle evaluation
+└── boltz_affinity.py        # Boltz oracle evaluation
+
+configs/                     # All Hydra configs in one place
+├── model.yaml               # Pretraining config
+├── experiment.yaml          # Single experiment defaults
+├── comparison/              # Comparison experiment configs
+├── sampler/                 # Per-sampler configs (6 files)
+├── reward/                  # Per-reward configs (7 files)
+└── finetune/                # Per-finetune configs (ddpp.yaml)
+```
+
 ## Web App (GenMol Studio)
 
 Interactive Streamlit app for molecule generation, evaluation, and experiment analysis.
 
 ```bash
-sh run_app.sh
+sh app/run_app.sh
 ```
 
-**Features:**
-- **Generate** — run any sampler (Standard, Beam Search, MCTS, DAPS, DFKC, SMC) with configurable hyperparameters
-- **Evaluate** — property distributions, chemical space PCA, scaffold analysis
-- **Compare** — overlay multiple runs side-by-side
-- **Results Explorer** — browse all saved experiments, scatter plots, **best-found vs. budget trajectories**
-- **Sweep** — launch multi-GPU hyperparameter sweeps with automatic result analysis
+## Inference-Time Samplers
 
-Experiments are auto-saved to `scripts/exps/denovo/outputs/results/` and appear in the Results Explorer.
-
-## Test-Time Compute Samplers
-
-Six samplers for reward-guided de novo generation. See [scripts/exps/denovo/README.md](scripts/exps/denovo/README.md) for full parameter docs, examples, and benchmarks.
+Six samplers for reward-guided de novo generation:
 
 | Sampler | Strategy | Key params |
 |---------|----------|------------|
@@ -47,40 +144,25 @@ All samplers track per-step reward calls and model forward passes for budget ana
 
 ---
 
-## 🚀 News
+## News
 
 #### 2025/10/15
-We introduce GenMol V2, trained with an extended SAFE syntax, demonstrating improved performance in *de novo* and fragment-constrained generation. Please refer to the section below: [GenMol V2: GenMol with Extended SAFE Syntax](#-genmol-v2-genmol-with-extended-safe-syntax).
+We introduce GenMol V2, trained with an extended SAFE syntax, demonstrating improved performance in *de novo* and fragment-constrained generation. Please refer to the section below: [GenMol V2: GenMol with Extended SAFE Syntax](#genmol-v2-genmol-with-extended-safe-syntax).
 
 ## Table of Contents
-- [Contribution](#contribution)
-- [Web App (GenMol Studio)](#web-app-genmol-studio)
-- [Test-Time Compute Samplers](#test-time-compute-samplers)
-- [🚀 News](#-news)
-    - [2025/10/15](#20251015)
-- [Table of Contents](#table-of-contents)
-- [📦 Installation](#-installation)
-- [🔬 GenMol V1](#-genmol-v1)
-  - [Training](#training)
-  - [(Optional) Training with User-defined Dataset](#optional-training-with-user-defined-dataset)
-  - [*De Novo* Generation](#de-novo-generation)
-  - [Fragment-constrained Generation](#fragment-constrained-generation)
-  - [Goal-directed Hit Generation (PMO Benchmark)](#goal-directed-hit-generation-pmo-benchmark)
-  - [Goal-directed Lead Optimization](#goal-directed-lead-optimization)
-- [🚀 GenMol V2: GenMol with Extended SAFE Syntax (Angle-Brackets for Inter-Fragment Attachment Points)](#-genmol-v2-genmol-with-extended-safe-syntax-angle-brackets-for-inter-fragment-attachment-points)
-  - [Summary:](#summary)
-  - [Introduction:](#introduction)
-  - [Benchmarks](#benchmarks)
-  - [Training](#training-1)
-  - [*De Novo* Generation](#de-novo-generation-1)
-  - [Fragment-constrained Generation](#fragment-constrained-generation-1)
+- [Design Space](#design-space)
+- [Codebase Structure](#codebase-structure)
+- [Inference-Time Samplers](#inference-time-samplers)
+- [Installation](#installation)
+- [GenMol V1](#genmol-v1)
+- [GenMol V2](#genmol-v2-genmol-with-extended-safe-syntax)
 - [License](#license)
-- [📝 Citation](#-citation)
+- [Citation](#citation)
 
-## 📦 Installation
+## Installation
 Clone this repository:
 ```bash
-git clone https://github.com/NVIDIA-Digital-Bio/genmol.git
+git clone https://github.com/arielyyd/genmol.git
 cd genmol
 ```
 
@@ -121,15 +203,15 @@ echo "Fixed safe package in environment: $CONDA_PREFIX"
 ```
 </details>
 
-## 🔬 GenMol V1
+## GenMol V1
 ### Training
-We provide the pretrained [checkpoint](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/clara/resources/genmol_v1). Place `model.ckpt` in the checkpoints directory and set the correct information in ./configs/base.yaml.
+We provide the pretrained [checkpoint](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/clara/resources/genmol_v1). Place `model.ckpt` in the checkpoints directory and set the correct information in `configs/model.yaml`.
 
 (Optional) To train GenMol from scratch, run the following command:
 ```bash
-torchrun --nproc_per_node ${num_gpu} scripts/train.py hydra.run.dir=${save_dir} wandb.name=${exp_name}
+torchrun --nproc_per_node ${num_gpu} scripts/training/train.py hydra.run.dir=${save_dir} wandb.name=${exp_name}
 ```
-Other hyperparameters can be adjusted in `configs/base.yaml`.<br>
+Other hyperparameters can be adjusted in `configs/model.yaml`.<br>
 The training used 8 NVIDIA A100 GPUs and took ~5 hours.
 
 We suggest the use of [SAFE dataset V2](https://huggingface.co/datasets/datamol-io/safe-drugs) to train GenMol (Note V2 removes some invalid molecules/corrupted SAFE strings. The original data that was used by GenMol is available here [SAFE dataset V1](https://huggingface.co/datasets/datamol-io/safe-gpt/tree/b83175cd7394).
@@ -147,12 +229,12 @@ NS(=O)(=O)c1cc2c(cc1Cl)NC(C1CC3C=CC1C3)NS2(=O)=O
 ```
 `${data_path}` is the path of the processed dataset.
 
-Then, set `data` in `base.yaml` to `${data_path}`.
+Then, set `data` in `configs/model.yaml` to `${data_path}`.
 
 ### *De Novo* Generation
 Run the following command to perform *de novo* generation:
 ```bash
-python scripts/exps/denovo/run.py
+python scripts/run.py sampler=uncond reward=none
 ```
 
 <details>
@@ -171,30 +253,30 @@ The experiment in the paper used 1 NVIDIA A100 GPU.
 ### Fragment-constrained Generation
 Run the following command to perform fragment-constrained generation:
 ```bash
-python scripts/exps/frag/run.py
+python scripts/benchmarks/frag/run.py
 ```
 
 The experiment in the paper used 1 NVIDIA A100 GPU.
 
 ### Goal-directed Hit Generation (PMO Benchmark)
 
-We provide the fragment vocabularies in the folder `scripts/exps/pmo/vocab`.
+We provide the fragment vocabularies in the folder `scripts/benchmarks/pmo/vocab`.
 
 (Optional) Place [zinc250k.csv](https://www.kaggle.com/datasets/basu369victor/zinc250k) in the `data` folder, then run the following command to construct the fragment vocabularies and label the molecules with property labels:
 ```bash
-python scripts/exps/pmo/get_vocab.py
+python scripts/benchmarks/pmo/get_vocab.py
 ```
 
 Run the following command to perform goal-directed hit generation:
 ```bash
-python scripts/exps/pmo/run.py -o ${oracle_name}
+python scripts/benchmarks/pmo/run.py -o ${oracle_name}
 ```
-The generated molecules will be saved in `scripts/exps/pmo/main/genmol/results`.
+The generated molecules will be saved in `scripts/benchmarks/pmo/main/genmol/results`.
 
 Run the following command to evaluate the result:
 ```bash
-python scripts/exps/pmo/eval.py ${file_name}
-# e.g., python scripts/exps/pmo/eval.py scripts/exps/pmo/main/genmol/results/albuterol_similarity_0.csv
+python scripts/benchmarks/pmo/eval.py ${file_name}
+# e.g., python scripts/benchmarks/pmo/eval.py scripts/benchmarks/pmo/main/genmol/results/albuterol_similarity_0.csv
 ```
 
 The experiment in the paper used 1 NVIDIA A100 GPU and took ~2-4 hours for each task.
@@ -202,19 +284,19 @@ The experiment in the paper used 1 NVIDIA A100 GPU and took ~2-4 hours for each 
 ### Goal-directed Lead Optimization
 Run the following command to perform goal-directed lead optimization:
 ```bash
-python scripts/exps/lead/run.py -o ${oracle_name} -i ${start_mol_idx} -d ${sim_threshold}
+python scripts/benchmarks/lead/run.py -o ${oracle_name} -i ${start_mol_idx} -d ${sim_threshold}
 ```
-The generated molecules will be saved in `scripts/exps/lead/results`.
+The generated molecules will be saved in `scripts/benchmarks/lead/results`.
 
 Run the following command to evaluate the result:
 ```bash
-python scripts/exps/lead/eval.py ${file_name}
-# e.g., python scripts/exps/lead/eval.py scripts/exps/lead/results/parp1_id0_thr0.4_0.csv
+python scripts/benchmarks/lead/eval.py ${file_name}
+# e.g., python scripts/benchmarks/lead/eval.py scripts/benchmarks/lead/results/parp1_id0_thr0.4_0.csv
 ```
 
 The experiment in the paper used 1 NVIDIA A100 GPU and took ~10 min for each task.
 
-## 🚀 GenMol V2: GenMol with Extended SAFE Syntax (Angle-Brackets for Inter-Fragment Attachment Points)
+## GenMol V2: GenMol with Extended SAFE Syntax
 ### Summary: 
 GenMol V2 introduces Extended SAFE Syntax, which uses *angle-brackets* for Inter-Fragment Attachment Points. This change improves performance for specific tasks, particularly one-step linker design.
 
@@ -276,24 +358,25 @@ GenMol V2 trained with the extended SAFE syntax actually shows significantly imp
 | GenMol V2 | 80.0 |
 
 ### Training
-We provide the trained GenMol V2 [checkpoint](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/clara/resources/genmol_v2?version=1.0). Place `model_v2.ckpt` in the checkpoints directory and set the correct information in ./configs/base.yaml.
+We provide the trained GenMol V2 [checkpoint](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/clara/resources/genmol_v2?version=1.0). Place `model_v2.ckpt` in the checkpoints directory and set the correct information in `configs/model.yaml`.
 
 (Optional) To train GenMol V2 from scratch, run the following command:
 ```bash
-torchrun --nproc_per_node ${num_gpu} scripts/train.py hydra.run.dir=${save_dir} wandb.name=${exp_name} loader.global_batch_size=1024 training.use_bracket_safe=true
+torchrun --nproc_per_node ${num_gpu} scripts/training/train.py hydra.run.dir=${save_dir} wandb.name=${exp_name} loader.global_batch_size=1024 training.use_bracket_safe=true
 ```
 The training used 8 NVIDIA A100 GPUs.
 
 ### *De Novo* Generation
 Run the following command to perform *de novo* generation using GenMol V2:
 ```bash
-python scripts/exps/denovo/run.py -c scripts/exps/frag/hparams_v2.yaml
+python scripts/run.py sampler=uncond reward=none
 ```
+Ensure `configs/model.yaml` points to the V2 checkpoint.
 
 ### Fragment-constrained Generation
 Run the following command to perform fragment-constrained generation using GenMol V2:
 ```bash
-python scripts/exps/frag/run.py -c scripts/exps/frag/hparams_v2.yaml
+python scripts/benchmarks/frag/run.py -c scripts/benchmarks/frag/hparams_v2.yaml
 ```
 
 ## License
@@ -301,7 +384,7 @@ Copyright @ 2025, NVIDIA Corporation. All rights reserved.<br>
 The source code is made available under Apache-2.0.<br>
 The model weights are made available under the [NVIDIA Open Model License](https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-license/).
 
-## 📝 Citation
+## Citation
 If you find this repository and our paper useful, we kindly request to cite our work.
 ```BibTex
 @article{lee2025genmol,

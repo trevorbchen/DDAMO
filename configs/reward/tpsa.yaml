@@ -1,0 +1,5 @@
+# @package _global_
+reward:
+  type: tpsa
+  target: genmol.rewards.TPSAReward
+  params: {}

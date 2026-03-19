@@ -1,0 +1,5 @@
+# @package _global_
+reward:
+  type: logp
+  target: genmol.rewards.LogPReward
+  params: {}

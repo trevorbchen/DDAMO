@@ -1,6 +1,0 @@
-# @package _global_
-reward:
-  type: qed
-  beta: 1.0
-  target: genmol.rewards.QEDReward
-  params: {}

@@ -314,6 +314,8 @@ class BeamSearchSampler(Sampler):
         step = 0
         reward_evals = 0
         fp_count = 0
+        last_logged_fp = 0
+        last_logged_re = 0
         while step < total_steps:
             k = min(K, total_steps - step)
 
@@ -339,6 +341,15 @@ class BeamSearchSampler(Sampler):
                 rollout_smiles = self._decode_smiles(candidates)
                 scores = self.forward_op(rollout_smiles).to(candidates.device)
             reward_evals += len(candidates)
+
+            # Trajectory logging
+            self._log_point(
+                reward_evals - last_logged_re,
+                fp_count - last_logged_fp,
+                scores.max().item(),
+            )
+            last_logged_re = reward_evals
+            last_logged_fp = fp_count
 
             # Elite buffer sees raw (unpenalized) scores — it's a global best-of
             # across all iterations, independent of the diversity pressure applied
@@ -398,6 +409,8 @@ class BeamSearchSampler(Sampler):
         total_steps = max(self.mdlm.get_num_steps_confidence(x_proto.repeat(N, 1)), 2)
         # Default K ≈ T/4 gives ~4 branch-prune cycles, matching Complexa §3.4
         K = _K if _K is not None else max(1, total_steps // 4)
+
+        self._reset_trajectory()
 
         # Each beam run yields up to N molecules; run enough beams to cover
         # the requested num_samples. Each run has its own elite buffer so that

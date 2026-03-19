@@ -34,7 +34,7 @@ add_beam() {
     local B=$1 N=$2 L=$3 TEMP=$4
     local K=$(derive_K $B $L)
     local NAME="beam_B${B}_N${N}_L${L}_t${TEMP/./}"
-    JOBS+=("python3 run_beam_mcts.py sampler=beam_search $REWARD $N_SAMPLES $OUT $BUF \
+    JOBS+=("python3 run_generation.py sampler=beam_search $REWARD $N_SAMPLES $OUT $BUF \
         softmax_temp=$TEMP \
         sampler.steps_per_interval=$K \
         sampler.branching_factor=$L \
@@ -45,7 +45,7 @@ add_beam() {
 add_mcts() {
     local B=$1 L=$2 C=$3
     local NAME="mcts_B${B}_L${L}_c${C/./}"
-    JOBS+=("python3 run_beam_mcts.py sampler=mcts $REWARD $N_SAMPLES $OUT \
+    JOBS+=("python3 run_generation.py sampler=mcts $REWARD $N_SAMPLES $OUT \
         sampler.branching_factor=$L \
         sampler.c_uct=$C \
         sampler.rollout_budget_per_sample=$B \
@@ -108,7 +108,7 @@ echo ""
     export CUDA_VISIBLE_DEVICES=0
     if [ ! -f "outputs/sweep/none/uncond_baseline/metrics.json" ]; then
         echo "[GPU0] baseline: uncond"
-        python3 run_beam_mcts.py sampler=uncond $REWARD $N_SAMPLES $OUT name=uncond_baseline 2>/dev/null
+        python3 run_generation.py sampler=uncond $REWARD $N_SAMPLES $OUT name=uncond_baseline 2>/dev/null
     else
         echo "[GPU0] SKIP baseline: uncond (done)"
     fi

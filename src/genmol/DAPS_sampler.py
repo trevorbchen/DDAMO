@@ -377,26 +377,32 @@ class DAPSSampler(Sampler):
 			path,
 			forward_op=None,
 			num_steps=50,
-			alpha=100.0,
+			beta=100.0,
 			mh_steps=2,
 			max_mutations=1,
 			remask_max=0.6,
 			remask_min=0.05,
 			remask_schedule="linear",
 			ode_steps=20,
+			mutate_strategy="infill",
+			proposal_mask_frac=0.1,
 			seed=None,
+			verbose=False,
 			**kwargs,
 	):
 		super().__init__(path, forward_op=forward_op, **kwargs)
 		self.forward_op = forward_op #or MolecularWeightForwardOp()
 		self.num_steps = max(int(num_steps), 1)
-		self.alpha = float(alpha)
+		self.beta = float(beta)
 		self.mh_steps = max(int(mh_steps), 0)
 		self.max_mutations = max(int(max_mutations), 1)
 		self.remask_max = float(remask_max)
 		self.remask_min = float(remask_min)
 		self.remask_schedule = remask_schedule
 		self.ode_steps = max(int(ode_steps), 2)
+		self.mutate_strategy = mutate_strategy  # "infill" or "fragment"
+		self.proposal_mask_frac = float(proposal_mask_frac)
+		self.verbose = bool(verbose)
 		if seed is not None:
 			random.seed(seed)
 			torch.manual_seed(seed)
@@ -412,34 +418,30 @@ class DAPSSampler(Sampler):
 	def _reverse_diffusion(self, xt, t_start):
 		"""
 		Perform reverse diffusion from noisy xt to predicted clean x0.
-		Uses iterative denoising steps similar to ODE sampling.
-		
+		Uses MDLM DDPM reverse steps from t_start down to t=0.
+
 		Args:
 			xt: Current noisy tokens
 			t_start: Starting timestep (noise level)
-			
+
 		Returns:
 			x0hat: Predicted clean tokens
 		"""
 		x = xt.clone()
-		# Create sub-timesteps for ODE solver from t_start down to 0
+		# Create sub-timesteps from t_start down to 0
 		sub_timesteps = torch.linspace(float(t_start), 0.0, self.ode_steps)
-		
+
 		for i in range(len(sub_timesteps) - 1):
 			t_cur = sub_timesteps[i]
-			t_next = sub_timesteps[i + 1]
-			
-			# Get model prediction at current timestep
+			dt = t_cur - sub_timesteps[i + 1]
+
 			attention_mask = x != self.pad_index
 			logits = self.model(x, attention_mask)
-			
-			# Use confidence-based sampling to denoise
-			# Use low temperature for deterministic denoising
-			x = self.mdlm.step_confidence(
-				logits, x, i, len(sub_timesteps) - 1,
-				0.1,  # softmax_temp - low temperature for more deterministic
-				0.1   # randomness
-			)
+
+			# MDLM DDPM reverse step using actual noise schedule
+			t_tensor = torch.full((x.shape[0],), float(t_cur), device=x.device)
+			dt_tensor = torch.full((x.shape[0],), float(dt), device=x.device)
+			x = self.mdlm.step(logits, t_tensor, x, dt_tensor, temperature=0.1)
 		return x
 
 	def _mask_fraction(self, step):
@@ -613,6 +615,40 @@ class DAPSSampler(Sampler):
 		return out
 
 	def _propose_tokens(self, x):
+		"""Propose new tokens using the configured mutate_strategy.
+
+		Strategies:
+		  "infill"   – mask a random fraction of tokens and re-fill with one
+		               model forward pass (fast, high validity).
+		  "fragment" – mutate SAFE fragments via SafeFragmentLinker
+		               (legacy, slower, lower validity).
+		"""
+		if self.mutate_strategy == "fragment":
+			return self._propose_tokens_fragment(x)
+		return self._propose_tokens_infill(x)
+
+	def _propose_tokens_infill(self, x):
+		proposal = x.clone()
+		can_mask = (
+			(x != self.pad_index)
+			& (x != self.model.bos_index)
+			& (x != self.model.eos_index)
+		)
+		rand = torch.rand_like(x, dtype=torch.float)
+		mask = (rand < self.proposal_mask_frac) & can_mask
+		proposal[mask] = self.model.mask_index
+
+		attention_mask = proposal != self.pad_index
+		logits = self.model(proposal, attention_mask)
+
+		probs = torch.softmax(logits / 0.5, dim=-1)
+		sampled = torch.multinomial(
+			probs.view(-1, probs.size(-1)), 1
+		).view(x.shape)
+		proposal[mask] = sampled[mask]
+		return proposal
+
+	def _propose_tokens_fragment(self, x):
 		x = x.clone()
 		safe_strings = self._decode_safe(x)
 		seq_len = x.shape[1]
@@ -643,48 +679,55 @@ class DAPSSampler(Sampler):
 		valid_safe_proposals = 0
 		valid_smiles_proposals = 0
 		
+		# Decode current smiles once; re-decode only for accepted proposals
+		cur_smiles = self._decode_keep_none(x, debug=False)
+		cur_scores = self.forward_op(cur_smiles).to(x.device)
+
 		for _ in range(self.mh_steps):
 			proposal = self._propose_tokens(x)
-			cur_smiles = self._decode_keep_none(x, debug=False)
 			prop_smiles = self._decode_keep_none(proposal, debug=True)
-			
+
 			# If proposal SMILES are invalid, keep the original molecule
 			valid_mask = torch.tensor([s is not None for s in prop_smiles], device=x.device)
-			if valid_mask.numel() == x.size(0):
-				invalid_mask = ~valid_mask
-				if invalid_mask.any():
-					proposal = proposal.clone()
-					proposal[invalid_mask] = x[invalid_mask]
-					for idx, is_valid in enumerate(valid_mask.tolist()):
-						if not is_valid:
-							prop_smiles[idx] = cur_smiles[idx]
-			
+			invalid_mask = ~valid_mask
+			if invalid_mask.any():
+				proposal = proposal.clone()
+				proposal[invalid_mask] = x[invalid_mask]
+				for idx in invalid_mask.nonzero(as_tuple=True)[0].tolist():
+					prop_smiles[idx] = cur_smiles[idx]
+
 			# Count valid SAFE strings (proposals that could be decoded)
 			prop_safe = self._decode_safe(proposal)
 			step_total = len(prop_safe)
 			step_valid_safe = sum(s is not None and s != "" for s in prop_safe)
 			total_proposals += step_total
 			valid_safe_proposals += step_valid_safe
-			
+
 			# Track SMILES validity for debugging only
 			valid_smiles_proposals += sum(s is not None for s in prop_smiles)
 
-			cur_scores = self.forward_op(cur_smiles).to(x.device)
 			prop_scores = self.forward_op(prop_smiles).to(x.device)
 
-			log_ratio = self.alpha * (prop_scores - cur_scores)
+			log_ratio = self.beta * (prop_scores - cur_scores)
 			log_ratio = torch.nan_to_num(log_ratio, nan=-1e9, neginf=-1e9, posinf=1e9)
 			accept_prob = torch.clamp(torch.exp(log_ratio), max=1.0)
 			u = torch.rand_like(accept_prob).to(x.device)
 			accept = (u < accept_prob).unsqueeze(-1).to(x.device)
+			accept_flat = accept.squeeze(-1)
 			x = torch.where(accept, proposal, x)
+
+			# Update cached smiles/scores only for accepted proposals
+			if accept_flat.any():
+				for idx in accept_flat.nonzero(as_tuple=True)[0].tolist():
+					cur_smiles[idx] = prop_smiles[idx]
+				cur_scores = torch.where(accept_flat, prop_scores, cur_scores)
 
 			accept_sum += accept.float().mean().item()
 			valid_sum += step_valid_safe / max(step_total, 1)
 			reward_sum += torch.nan_to_num(prop_scores, nan=-1e9, neginf=-1e9, posinf=1e9).mean().item()
 			log_ratio_sum += log_ratio.mean().item()
 			steps += 1
-			
+
 			if pbar is not None:
 				pbar.update(1)
 		
@@ -773,44 +816,58 @@ class DAPSSampler(Sampler):
 		xt = self._insert_mask(x, num_samples, min_add_len=min_add_len)
 		xt = xt.to(self.model.device)
 
-		# Adjust progress bar based on whether we have a forward operator
-		if self.forward_op is None:
-			# No reward function: just do reverse diffusion
-			total_iterations = self.num_steps
-		else:
-			# With reward function: reverse diffusion + MH steps
-			total_iterations = self.num_steps * max(1, self.mh_steps)
-		
+		self._reset_trajectory()
+
+		# Progress bar: reverse diffusion for all steps + MH only in second half (t < 0.5)
+		mh_per_step = max(1, self.mh_steps) if (self.forward_op is not None and self.mh_steps > 0) else 0
+		mh_steps_count = sum(1 for t in self.timesteps if t < 0.5)
+		total_iterations = self.num_steps + mh_steps_count * mh_per_step
 		pbar = tqdm(total=total_iterations, desc="DAPS Sampling")
 
 		for i in range(self.num_steps):
 			t_current = self.timesteps[i]
-			
+
 			# Step 1: Reverse diffusion - denoise xt to get x0hat
 			x0hat = self._reverse_diffusion(xt, t_current)
-			
-			# # Visualize current molecules
-			self._visualize_molecules_after_mh(x0hat)
-			
-			# Step 2: Metropolis-Hastings - refine x0hat using forward operator (only if reward is defined)
-			if self.forward_op is not None and self.alpha > 0 and self.mh_steps > 0:
+			pbar.update(1)
+
+			# Visualize current molecules (only in verbose mode)
+			if self.verbose:
+				self._visualize_molecules_after_mh(x0hat)
+
+			# Step 2: Metropolis-Hastings - refine x0hat using forward operator
+			# Only run MH in the second half of annealing (t < 0.5) where
+			# reverse diffusion produces decodable molecules.
+			run_mh = (
+				self.forward_op is not None
+				and self.beta > 0
+				and self.mh_steps > 0
+				and t_current < 0.5
+			)
+			if run_mh:
 				x0y, mh_stats = self._mh_step(x0hat, pbar)
 			else:
 				x0y, mh_stats = x0hat, None
-				if self.forward_op is None:
-					# No reward: just update progress bar for the step
-					pbar.update(1)
-				else:
-					# Reward exists but alpha=0 or mh_steps=0: update for skipped MH steps
-					pbar.update(max(1, self.mh_steps))
 			
 			# Log progress (use SAFE for display; SMILES only for scoring)
 			safe_strings = self._decode_safe(x0y)
+
+			# Count budget for this annealing step
+			fp_this_step = (self.ode_steps - 1) * num_samples  # _reverse_diffusion
+			re_this_step = 0
+			if run_mh:
+				# MH: 1 initial scoring + mh_steps proposal scorings
+				re_this_step += num_samples * (1 + self.mh_steps)
+				if self.mutate_strategy == "infill":
+					fp_this_step += self.mh_steps * num_samples
+
 			if self.forward_op is not None:
 				smiles = self._decode(x0y)
 				scores = self.forward_op(smiles)
+				re_this_step += num_samples  # this scoring call
 				mean_score = scores.mean().item()
-				postfix = {"Mean Score": f"{mean_score:.2f}"} #"Step": i + 1, #"t": f"{t_current:.3f}"
+				self._log_point(re_this_step, fp_this_step, scores.max().item())
+				postfix = {"Mean Score": f"{mean_score:.2f}"}
 				if mh_stats is not None:
 					postfix.update({
 						"MH acc": f"{mh_stats['accept']:.2f}",
@@ -820,6 +877,7 @@ class DAPSSampler(Sampler):
 					})
 				pbar.set_postfix(postfix)
 			else:
+				self._log_point(0, fp_this_step, float("-inf"))
 				pbar.set_postfix({"Step": i + 1, "t": f"{t_current:.3f}"})
 			
 			# Step 3: Forward diffusion - add noise for next iteration
@@ -834,64 +892,14 @@ class DAPSSampler(Sampler):
 				xt = x0y
 
 		pbar.close()
+
+		self.last_forward_passes = self._cumul_forward_passes
+		self.last_fp_per_sample = self._cumul_forward_passes / max(num_samples, 1)
+		self.last_reward_evals = self._cumul_reward_calls
+		self.last_budget_per_sample = self._cumul_reward_calls / max(num_samples, 1)
+
 		return self._decode_safe(xt)
 
 
-class MolecularWeightForwardOp:
-	def _smiles_error(self, smi):
-		"""Return a reason string for invalid SMILES, or None if valid."""
-		if not smi:
-			return "empty"
-		try:
-			mol = Chem.MolFromSmiles(smi)
-			if mol is not None:
-				return None
-		except Exception as exc:
-			return f"MolFromSmiles error: {exc}"
-		try:
-			mol = Chem.MolFromSmiles(smi, sanitize=False)
-			if mol is None:
-				return "MolFromSmiles returned None"
-			try:
-				Chem.SanitizeMol(mol)
-				return None
-			except Exception as exc:
-				return f"SanitizeMol error: {exc}"
-		except Exception as exc:
-			return f"MolFromSmiles(sanitize=False) error: {exc}"
-		return "unknown"
-
-	def __call__(self, smiles_list):
-		scores = []
-		invalid = []
-		for smi in smiles_list:
-			if not smi:
-				scores.append(float("-inf"))
-				invalid.append((smi, "empty"))
-				continue
-			try:
-				mol = Chem.MolFromSmiles(smi)
-				if mol is None:
-					try:
-						candidate = safe_to_smiles(bracketsafe2safe(smi), fix=True)
-						mol = Chem.MolFromSmiles(candidate) if candidate else None
-					except Exception:
-						mol = None
-				if mol is None:
-					scores.append(float("-inf"))
-					reason = self._smiles_error(smi)
-					invalid.append((smi, reason))
-					continue
-				scores.append(float(Descriptors.MolWt(mol)))
-			except Exception:
-				scores.append(float("-inf"))
-				reason = self._smiles_error(smi)
-				invalid.append((smi, reason))
-		#divide scores by 1000 to keep them in a reasonable range for exp/log operations in MH acceptance
-		# if invalid:
-		# 	print("\n[MW ForwardOp] Invalid SMILES detected:")
-		# 	for smi, reason in invalid:
-		# 		print(f"  - {smi}: {reason}")
-		scores = [s / 1000.0 for s in scores]
-
-		return torch.tensor(scores, dtype=torch.float32)
+# Backward-compat: reward classes now live in genmol.rewards
+from genmol.rewards import MolecularWeightForwardOp, get_reward  # noqa: F401

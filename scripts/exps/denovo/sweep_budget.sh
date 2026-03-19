@@ -30,7 +30,7 @@ K_VALUES=(1 2 5 10 20)
 
 run_baseline() {
     echo "--- baseline (unconditional) ---"
-    CUDA_VISIBLE_DEVICES=0 python3 run_beam_mcts.py sampler=uncond $REWARD num_samples=$N \
+    CUDA_VISIBLE_DEVICES=0 python3 run_generation.py sampler=uncond $REWARD num_samples=$N \
         name=budget_standard 2>/dev/null &
 }
 
@@ -38,17 +38,17 @@ run_default() {
     echo "--- default (softmax_temp=0.8) ---"
     local gpu=0
     for K in "${K_VALUES[@]}"; do
-        CUDA_VISIBLE_DEVICES=$gpu python3 run_beam_mcts.py sampler=beam_search $REWARD $SAMPLES \
+        CUDA_VISIBLE_DEVICES=$gpu python3 run_generation.py sampler=beam_search $REWARD $SAMPLES \
             softmax_temp=0.8 sampler.steps_per_interval=$K \
             name=budget_K${K}_L4_default 2>/dev/null &
         gpu=$(( (gpu + 1) % 2 ))
     done
     # Extra: L=2 and L=8 at K=5
-    CUDA_VISIBLE_DEVICES=0 python3 run_beam_mcts.py sampler=beam_search $REWARD \
+    CUDA_VISIBLE_DEVICES=0 python3 run_generation.py sampler=beam_search $REWARD \
         num_samples=$N sampler.beam_width=$N sampler.branching_factor=2 \
         sampler.steps_per_interval=5 softmax_temp=0.8 \
         name=budget_K5_L2_default 2>/dev/null &
-    CUDA_VISIBLE_DEVICES=1 python3 run_beam_mcts.py sampler=beam_search $REWARD \
+    CUDA_VISIBLE_DEVICES=1 python3 run_generation.py sampler=beam_search $REWARD \
         num_samples=$N sampler.beam_width=$N sampler.branching_factor=8 \
         sampler.steps_per_interval=5 softmax_temp=0.8 \
         name=budget_K5_L8_default 2>/dev/null &
@@ -58,17 +58,17 @@ run_temp() {
     echo "--- temp (softmax_temp=0.5) ---"
     local gpu=0
     for K in "${K_VALUES[@]}"; do
-        CUDA_VISIBLE_DEVICES=$gpu python3 run_beam_mcts.py sampler=beam_search $REWARD $SAMPLES \
+        CUDA_VISIBLE_DEVICES=$gpu python3 run_generation.py sampler=beam_search $REWARD $SAMPLES \
             softmax_temp=0.5 sampler.steps_per_interval=$K \
             name=budget_K${K}_L4_t05 2>/dev/null &
         gpu=$(( (gpu + 1) % 2 ))
     done
     # Extra: L=2 and L=8 at K=5
-    CUDA_VISIBLE_DEVICES=0 python3 run_beam_mcts.py sampler=beam_search $REWARD \
+    CUDA_VISIBLE_DEVICES=0 python3 run_generation.py sampler=beam_search $REWARD \
         num_samples=$N sampler.beam_width=$N sampler.branching_factor=2 \
         sampler.steps_per_interval=5 softmax_temp=0.5 \
         name=budget_K5_L2_t05 2>/dev/null &
-    CUDA_VISIBLE_DEVICES=1 python3 run_beam_mcts.py sampler=beam_search $REWARD \
+    CUDA_VISIBLE_DEVICES=1 python3 run_generation.py sampler=beam_search $REWARD \
         num_samples=$N sampler.beam_width=$N sampler.branching_factor=8 \
         sampler.steps_per_interval=5 softmax_temp=0.5 \
         name=budget_K5_L8_t05 2>/dev/null &
@@ -78,7 +78,7 @@ run_diversity() {
     echo "--- diversity (diversity_cutoff=0.6) ---"
     local gpu=0
     for K in "${K_VALUES[@]}"; do
-        CUDA_VISIBLE_DEVICES=$gpu python3 run_beam_mcts.py sampler=beam_search $REWARD $SAMPLES \
+        CUDA_VISIBLE_DEVICES=$gpu python3 run_generation.py sampler=beam_search $REWARD $SAMPLES \
             sampler.diversity_cutoff=0.6 sampler.steps_per_interval=$K \
             name=budget_K${K}_L4_div 2>/dev/null &
         gpu=$(( (gpu + 1) % 2 ))
@@ -89,7 +89,7 @@ run_randomness() {
     echo "--- randomness (randomness=2.0) ---"
     local gpu=0
     for K in "${K_VALUES[@]}"; do
-        CUDA_VISIBLE_DEVICES=$gpu python3 run_beam_mcts.py sampler=beam_search $REWARD $SAMPLES \
+        CUDA_VISIBLE_DEVICES=$gpu python3 run_generation.py sampler=beam_search $REWARD $SAMPLES \
             randomness=2.0 sampler.steps_per_interval=$K \
             name=budget_K${K}_L4_rand 2>/dev/null &
         gpu=$(( (gpu + 1) % 2 ))

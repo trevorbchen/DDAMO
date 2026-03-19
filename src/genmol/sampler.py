@@ -51,6 +51,12 @@ class Sampler:
         self.pad_index = self.model.tokenizer.pad_token_id
         self.mdlm = self.model.mdlm
         self.mdlm.to_device(self.model.device)
+
+        # Trajectory tracking (populated by subclasses during generation)
+        self._trajectory = []
+        self._cumul_reward_calls = 0
+        self._cumul_forward_passes = 0
+        self._best_reward = float("-inf")
         
     @torch.no_grad()
     def generate(self, x, softmax_temp=1.2, randomness=2, fix=True, gamma=0, w=2, **kwargs):
@@ -102,7 +108,31 @@ class Sampler:
         pad_len = max([len(xx) for xx in x_new])
         x_new = [torch.hstack([xx,torch.full((pad_len - len(xx),), self.pad_index)]) for xx in x_new]
         return torch.stack(x_new)
-    
+
+    # ── Trajectory tracking ───────────────────────────────────────
+
+    def _reset_trajectory(self):
+        """Call at the start of de_novo_generation to reset tracking state."""
+        self._trajectory = []
+        self._cumul_reward_calls = 0
+        self._cumul_forward_passes = 0
+        self._best_reward = float("-inf")
+
+    def _log_point(self, reward_calls_delta, fp_delta, best_reward_this_batch):
+        """Record one trajectory checkpoint with delta-based accumulation."""
+        self._cumul_reward_calls += reward_calls_delta
+        self._cumul_forward_passes += fp_delta
+        self._best_reward = max(self._best_reward, best_reward_this_batch)
+        self._trajectory.append({
+            "reward_calls": self._cumul_reward_calls,
+            "forward_passes": self._cumul_forward_passes,
+            "best_reward": self._best_reward,
+        })
+
+    @property
+    def trajectory(self):
+        return list(self._trajectory)
+
     @torch.no_grad()
     def de_novo_generation(self, num_samples=1, softmax_temp=0.8, randomness=0.5, min_add_len=40, **kwargs):
         # Prepare Fully Masked Inputs

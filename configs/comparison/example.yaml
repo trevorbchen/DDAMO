@@ -48,3 +48,12 @@ ddpp_checkpoint: null
 
 # ── Output ───────────────────────────────────────────────────────────
 output_dir: outputs/comparison
+
+# -- Wall-clock budget (seconds). None = use num_samples instead.
+# wall_budget_sec: 3600   # 1 hour
+
+# -- Batch size for wall-clock mode
+batch_size: 16
+
+# -- Cost multipliers for post-hoc oracle budget simulation
+cost_multipliers: [1, 2, 5, 10, 25, 50, 100]

@@ -1,0 +1,10 @@
+# @package _global_
+name: smc
+sampler:
+  _target_: genmol.samplers.SMCSampler
+  num_particles: 8
+  resample_interval: 5
+  resample_start: 0.5
+  beta: 10.0
+  ess_threshold: 0.5
+  resample_strategy: systematic

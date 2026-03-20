@@ -1,0 +1,5 @@
+# @package _global_
+reward:
+  type: mw
+  target: genmol.rewards.MolecularWeightReward
+  params: {}

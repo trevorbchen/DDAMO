@@ -224,13 +224,13 @@ def scaffold_counts(smiles_list):
 
 @st.cache_resource(show_spinner="Loading GenMol model …")
 def load_sampler(path: str):
-    from genmol.sampler import Sampler
+    from genmol.samplers import Sampler
     return Sampler(path)
 
 
 @st.cache_resource(show_spinner="Loading DAPS sampler …")
 def load_daps_sampler(path: str, reward_name: str, **kwargs):
-    from genmol.DAPS_sampler import DAPSSampler
+    from genmol.samplers import DAPSSampler
     from genmol.rewards import get_reward
     forward_op = get_reward(reward_name)
     return DAPSSampler(path, forward_op=forward_op, **kwargs)
@@ -238,7 +238,7 @@ def load_daps_sampler(path: str, reward_name: str, **kwargs):
 
 @st.cache_resource(show_spinner="Loading Beam Search sampler …")
 def load_beam_sampler(path: str, reward_name: str = "QED", **kwargs):
-    from genmol.beam_search_sampler import BeamSearchSampler
+    from genmol.samplers import BeamSearchSampler
     from genmol.rewards import get_reward
     forward_op = get_reward(reward_name)
     return BeamSearchSampler(path, forward_op=forward_op, **kwargs)
@@ -246,7 +246,7 @@ def load_beam_sampler(path: str, reward_name: str = "QED", **kwargs):
 
 @st.cache_resource(show_spinner="Loading MCTS sampler …")
 def load_mcts_sampler(path: str, reward_name: str = "QED", **kwargs):
-    from genmol.mcts_sampler import MCTSSampler
+    from genmol.samplers import MCTSSampler
     from genmol.rewards import get_reward
     forward_op = get_reward(reward_name)
     return MCTSSampler(path, forward_op=forward_op, **kwargs)
@@ -254,7 +254,7 @@ def load_mcts_sampler(path: str, reward_name: str = "QED", **kwargs):
 
 @st.cache_resource(show_spinner="Loading DFKC sampler …")
 def load_dfkc_sampler(path: str, reward_name: str = "none", **kwargs):
-    from genmol.smc_sampler import DFKCSampler
+    from genmol.samplers import DFKCSampler
     from genmol.rewards import get_reward
     forward_op = get_reward(reward_name)
     return DFKCSampler(path, forward_op=forward_op, **kwargs)
@@ -262,7 +262,7 @@ def load_dfkc_sampler(path: str, reward_name: str = "none", **kwargs):
 
 @st.cache_resource(show_spinner="Loading SMC sampler …")
 def load_smc_sampler(path: str, reward_name: str = "QED", **kwargs):
-    from genmol.smc_sampler import SMCSampler
+    from genmol.samplers import SMCSampler
     from genmol.rewards import get_reward
     forward_op = get_reward(reward_name)
     return SMCSampler(path, forward_op=forward_op, **kwargs)

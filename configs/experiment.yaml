@@ -1,0 +1,20 @@
+defaults:
+  - sampler: uncond
+  - reward: none
+  - _self_
+
+model_path: model_v2.ckpt        # pretrained GenMol checkpoint
+finetune: none                    # "none" or "ddpp"
+ddpp_checkpoint: null             # required if finetune=ddpp
+output_dir: outputs
+name: null
+num_samples: 100
+softmax_temp: 1.0
+randomness: 0.3
+min_add_len: 60
+seed: 0
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null

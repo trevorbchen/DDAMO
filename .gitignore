@@ -1,8 +1,9 @@
 # Byte-compiled / optimized / DLL files
 __pycache__/
-model.ckpt
+*.ckpt
 oracle/*
 FlashAffinity/checkpoints/*
+_archive/
 
 # Distribution / packaging
 .Python

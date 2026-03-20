@@ -1,0 +1,6 @@
+# @package _global_
+reward:
+  type: boltz
+  target: genmol.rewards.boltz.BoltzAffinityReward
+  params:
+    diffusion_samples: 4

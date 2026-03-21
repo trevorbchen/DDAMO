@@ -1,12 +1,16 @@
-"""Design space comparison with wall-clock budget control and oracle timeline logging.
+"""Design space comparison: rank methods under controlled compute budgets.
 
-Runs each (sampler x finetune x guide) combo under a fixed wall-clock time budget.
-Logs oracle evaluations one-by-one so the timeline can be subsampled post-hoc to
+Supports two config formats:
+  1. Grid mode:  samplers × finetune × guide_rewards (Cartesian product)
+  2. Methods mode: explicit list of {name, sampler, finetune, guide} dicts
+
+After generation, an oracle reward scores all molecules one-by-one, logging a
+timeline entry after each call so the timeline can be subsampled post-hoc to
 simulate a more expensive oracle (e.g. 10x, 100x cost multiplier).
 
-Timeline log format (oracle_timeline.jsonl per combo):
-    {"call": 1,  "smiles": "...", "score": -0.4, "best_so_far": -0.4, "top10_mean": -0.4, "wall_sec": 12.3}
-    {"call": 2,  "smiles": "...", "score": -0.1, "best_so_far": -0.4, "top10_mean": -0.25, "wall_sec": 24.1}
+Timeline log format (oracle_timeline.jsonl per method):
+    {"call": 1, "smiles": "...", "score": -0.4, "best_so_far": -0.4,
+     "top10_mean": -0.4, "wall_sec_before": 12.3, "wall_sec_after": 12.9}
     ...
 
 Post-hoc cost simulation:
@@ -14,9 +18,11 @@ Post-hoc cost simulation:
     Read off best_so_far at indices [0, N, 2N, ...] to get the budget curve.
 
 Usage:
-    python scripts/comparison.py --config configs/comparison/example.yaml
-    python scripts/comparison.py --config configs/comparison/example.yaml --dry-run
-    python scripts/comparison.py --config configs/comparison/example.yaml --skip-oracle
+    python scripts/comparison.py --config configs/comparison/fa_1hr.yaml
+    python scripts/comparison.py --config configs/comparison/fa_1hr.yaml --dry-run
+    python scripts/comparison.py --config configs/comparison/fa_1hr.yaml --skip-oracle
+    python scripts/comparison.py --config configs/comparison/fa_1hr.yaml --simulate-budget
+    python scripts/comparison.py --config configs/comparison/fa_1hr.yaml --skip-generation
 """
 
 import argparse
@@ -24,159 +30,346 @@ import itertools
 import json
 import os
 import sys
-import time
-from collections import deque
+from datetime import datetime
+from time import time
 
+import numpy as np
 import pandas as pd
 import yaml
 
 sys.path.insert(0, os.path.realpath("."))
 sys.path.insert(0, os.path.join(os.path.realpath("."), "src"))
+sys.path.insert(0, os.path.join(os.path.realpath("."), "FlashAffinity", "src"))
 
 from genmol.samplers import (
     Sampler, BeamSearchSampler, MCTSSampler, SMCSampler, DFKCSampler, DAPSSampler,
-    load_model_from_path,
+    load_model_from_path, decode_smiles,
 )
-from genmol.rewards import get_reward
+from genmol.rewards import get_reward, KLPenalizedReward
 from genmol.model_loader import merge_ddpp_checkpoint
 from evals.metrics import compute_metrics
 
 SAMPLER_CLASSES = {
-    "uncond":      Sampler,
+    "uncond": Sampler,
     "beam_search": BeamSearchSampler,
-    "mcts":        MCTSSampler,
-    "smc":         SMCSampler,
-    "dfkc":        DFKCSampler,
-    "daps":        DAPSSampler,
+    "mcts": MCTSSampler,
+    "smc": SMCSampler,
+    "dfkc": DFKCSampler,
+    "daps": DAPSSampler,
 }
 
 
-# ── Config ────────────────────────────────────────────────────────────────────
+# ── Config ─────────────────────────────────────────────────────────────────────
 
 def load_config(path):
     with open(path) as f:
         return yaml.safe_load(f)
 
 
-# ── Model loading (cached) ────────────────────────────────────────────────────
+def build_methods(cfg):
+    """Build list of methods from config.
 
-def resolve_model(finetune_method, cfg, model_cache):
-    if finetune_method in model_cache:
-        return model_cache[finetune_method]
-    model_path = os.path.realpath(cfg["model_path"])
-    if finetune_method == "ddpp":
-        ddpp_ckpt = cfg.get("ddpp_checkpoint")
-        if ddpp_ckpt is None:
-            raise ValueError("finetune includes 'ddpp' but ddpp_checkpoint is not set")
-        model_path = merge_ddpp_checkpoint(model_path, os.path.realpath(ddpp_ckpt))
-    model = load_model_from_path(model_path)
-    model_cache[finetune_method] = model
-    return model
-
-
-# ── Generation (wall-clock controlled) ───────────────────────────────────────
-
-def run_generation(sampler_name, finetune_method, guide_name, cfg, model_cache,
-                   wall_budget_sec=None):
-    """Generate molecules for up to wall_budget_sec seconds (or cfg.num_samples if no budget).
-
-    Returns (samples, metrics).
+    Supports either explicit 'methods' list or grid mode (samplers x finetune x guide_rewards).
+    Returns list of dicts with keys: name, sampler, finetune, guide.
     """
-    model = resolve_model(finetune_method, cfg, model_cache)
+    if "methods" in cfg:
+        return cfg["methods"]
 
-    forward_op = None
-    if guide_name not in ("none", None):
+    # Grid mode (backward compat)
+    samplers = cfg.get("samplers", ["uncond"])
+    finetunes = cfg.get("finetune", ["none"])
+    guides = cfg.get("guide_rewards", ["none"])
+    methods = []
+    for s, ft, g in itertools.product(samplers, finetunes, guides):
+        methods.append({"name": f"{ft}/{g}/{s}", "sampler": s, "finetune": ft, "guide": g})
+    return methods
+
+
+def get_budget_sec(cfg):
+    """Read budget from config, supporting both naming conventions."""
+    return cfg.get("wall_clock_budget_sec") or cfg.get("wall_budget_sec")
+
+
+# ── Generation methods ─────────────────────────────────────────────────────────
+
+def run_inference_method(method, cfg, model_cache):
+    """Run an inference-time method (sampler with optional guide reward).
+
+    Returns (samples: list[str], metrics: dict).
+    """
+    sampler_name = method["sampler"]
+    guide_name = method.get("guide", "none")
+    timeout_sec = get_budget_sec(cfg)
+
+    # Load model (cached)
+    if "base" not in model_cache:
+        model_cache["base"] = load_model_from_path(os.path.realpath(cfg["model_path"]))
+    model = model_cache["base"]
+
+    # Guide reward
+    if guide_name in ("none", None, ""):
+        forward_op = None
+    else:
         forward_op = get_reward(guide_name, **cfg.get("guide_reward_params", {}))
 
+    # KL penalty wrapper
+    kl_cfg = cfg.get("kl_penalty", {})
+    if kl_cfg.get("enabled", False) and forward_op is not None:
+        lam = kl_cfg.get("lam", 0.01)
+        forward_op = KLPenalizedReward(forward_op, model, lam=lam)
+
+    # Sampler
     cls = SAMPLER_CLASSES[sampler_name]
     overrides = cfg.get("sampler_overrides", {}).get(sampler_name, {})
     sampler = cls(model=model, forward_op=forward_op, **overrides)
 
-    gen_kwargs = dict(
-        softmax_temp=cfg.get("softmax_temp", 1.0),
-        randomness=cfg.get("randomness", 0.3),
-        min_add_len=cfg.get("min_add_len", 60),
-    )
+    # Generate
+    start_ts = datetime.now().isoformat()
+    t0 = time()
 
-    samples = []
-    t_start = time.time()
+    is_baseline = forward_op is None
 
-    if wall_budget_sec is None:
-        # fixed num_samples mode (original behaviour)
-        batch = sampler.de_novo_generation(cfg.get("num_samples", 100), **gen_kwargs)
-        samples.extend([s for s in batch if s])
+    # Baseline: interleave generate + score until budget runs out
+    baseline_scores = None
+    baseline_reward_calls = 0
+    baseline_trajectory = []
+    scored_pool_with_time = []
+    if is_baseline and timeout_sec is not None:
+        from evals.flash_affinity import run_flash_affinity
+        oracle_params = cfg.get("oracle_params", {})
+        BATCH = 256
+        scored_pool = []  # list of (score, smiles)
+        best_so_far = float("-inf")
+        cycle = 0
+        while time() - t0 < timeout_sec:
+            cycle += 1
+            batch_smiles = sampler.de_novo_generation(
+                BATCH,
+                softmax_temp=cfg.get("softmax_temp", 1.0),
+                randomness=cfg.get("randomness", 0.3),
+                min_add_len=cfg.get("min_add_len", 60),
+            )
+            if time() - t0 >= timeout_sec:
+                break
+            scores = run_flash_affinity(batch_smiles, **oracle_params)
+            baseline_reward_calls += len(batch_smiles)
+            wall = time() - t0
+            for smi, sc in zip(batch_smiles, scores):
+                if sc is not None:
+                    scored_pool.append((sc, smi))
+                    scored_pool_with_time.append((sc, smi, wall))
+                    if sc > best_so_far:
+                        best_so_far = sc
+            baseline_trajectory.append({
+                "wall_sec": time() - t0,
+                "reward_calls": baseline_reward_calls,
+                "best_reward": best_so_far,
+            })
+            best = max(scored_pool, key=lambda x: x[0])[0] if scored_pool else 0
+            print(f"  [baseline] cycle {cycle}: {len(scored_pool)} scored, "
+                  f"best={best:.4f}, {time()-t0:.0f}s/{timeout_sec}s", flush=True)
+        # Sort best-first, deduplicate
+        scored_pool.sort(reverse=True)
+        seen = set()
+        samples, baseline_scores = [], []
+        for sc, smi in scored_pool:
+            if smi not in seen:
+                seen.add(smi)
+                samples.append(smi)
+                baseline_scores.append(sc)
     else:
-        # wall-clock mode: keep generating batches until time runs out
-        batch_size = cfg.get("batch_size", 16)
-        while (time.time() - t_start) < wall_budget_sec:
-            batch = sampler.de_novo_generation(batch_size, **gen_kwargs)
-            samples.extend([s for s in batch if s])
+        samples = sampler.de_novo_generation(
+            cfg.get("num_samples", 100),
+            softmax_temp=cfg.get("softmax_temp", 1.0),
+            randomness=cfg.get("randomness", 0.3),
+            min_add_len=cfg.get("min_add_len", 60),
+            timeout_sec=timeout_sec,
+        )
 
-    elapsed = time.time() - t_start
+    elapsed = time() - t0
+    end_ts = datetime.now().isoformat()
 
     m = compute_metrics(samples)
     metrics = {
-        "sampler":          sampler_name,
-        "finetune":         finetune_method,
-        "guide_reward":     guide_name,
-        "wall_sec":         round(elapsed, 2),
-        "wall_budget_sec":  wall_budget_sec,
-        "n_generated":      len(samples),
-        "reward_calls":     getattr(sampler, "last_reward_evals", 0),
-        "forward_passes":   getattr(sampler, "last_forward_passes", 0),
-        "budget_per_sample": getattr(sampler, "last_budget_per_sample", 0),
+        "method": method["name"],
+        "sampler": sampler_name,
+        "finetune": "none",
+        "guide_reward": guide_name,
+        "start_time": start_ts,
+        "end_time": end_ts,
+        "wall_sec": round(elapsed, 2),
+        "reward_calls": baseline_reward_calls or getattr(sampler, "last_reward_evals", 0),
+        "forward_passes": getattr(sampler, "last_forward_passes", 0),
         **{k: m[k] for k in ("validity", "uniqueness", "qed_mean", "qed_top10", "qed_max")},
+        "num_samples": len(samples),
         **{f"sampler_{k}": v for k, v in overrides.items()},
     }
+    if baseline_scores is not None:
+        metrics["_scores"] = baseline_scores
+    if not is_baseline and hasattr(sampler, "trajectory"):
+        metrics["_trajectory"] = sampler.trajectory
+    if not is_baseline and hasattr(sampler, "snapshots"):
+        metrics["_snapshots"] = sampler.snapshots
+    if is_baseline and scored_pool_with_time:
+        metrics["_trajectory"] = baseline_trajectory
+        # Build baseline snapshots from scored_pool_with_time
+        baseline_snapshots = {}
+        for hr in range(1, 10):
+            cutoff = hr * 3600
+            pool_at_hr = [(sc, smi) for sc, smi, w in scored_pool_with_time if w <= cutoff]
+            if pool_at_hr:
+                pool_at_hr.sort(reverse=True)
+                seen = set()
+                snap = []
+                for sc, smi in pool_at_hr:
+                    if smi not in seen:
+                        seen.add(smi)
+                        snap.append({"smiles": smi, "score": sc})
+                baseline_snapshots[f"{hr}hr"] = snap
+        if baseline_snapshots:
+            metrics["_snapshots"] = baseline_snapshots
     return samples, metrics
 
 
-# ── Oracle (one-by-one with timeline logging) ─────────────────────────────────
+def run_ddpp_method(method, cfg, model_cache):
+    """Run DDPP: train for budget, then generate unconditionally.
+
+    Returns (samples: list[str], metrics: dict).
+    """
+    from genmol.finetune import DDPPLBTrainer
+
+    timeout_sec = get_budget_sec(cfg)
+    ddpp_cfg = cfg.get("ddpp_overrides", {})
+
+    # Load pretrained model
+    if "base" not in model_cache:
+        model_cache["base"] = load_model_from_path(os.path.realpath(cfg["model_path"]))
+    model = model_cache["base"]
+
+    # Guide reward for DDPP training data collection
+    guide_name = method.get("guide", "none")
+    if guide_name in ("none", None, ""):
+        oracle_name = cfg.get("oracle", "flash_affinity")
+        reward_fn = get_reward(oracle_name, **cfg.get("oracle_params", {}))
+    else:
+        reward_fn = get_reward(guide_name, **cfg.get("guide_reward_params", {}))
+
+    model_path = os.path.realpath(cfg["model_path"])
+    trainer = DDPPLBTrainer(
+        model_path=model_path,
+        reward_fn=reward_fn,
+        lr=ddpp_cfg.get("lr", 1e-4),
+        batch_size=ddpp_cfg.get("batch_size", 16),
+        lr_logz=ddpp_cfg.get("lr_logz", 1e-3),
+        warmup_logz_steps=ddpp_cfg.get("warmup_logz_steps", 500),
+        replay_buffer_size=ddpp_cfg.get("replay_buffer_size", 10000),
+        refill_interval=ddpp_cfg.get("refill_interval", 250),
+        ema_decay=ddpp_cfg.get("ema_decay", 0.9999),
+    )
+
+    # Budget split: 85% train, 10% generate, 5% score
+    t0 = time()
+    train_budget = timeout_sec * 0.85 if timeout_sec else None
+    max_steps = ddpp_cfg.get("num_steps", 10000)
+    trainer.train(max_steps, timeout_sec=train_budget)
+    train_elapsed = time() - t0
+    print(f"  [ddpp] Training done: {train_elapsed:.0f}s, {trainer.global_step} steps", flush=True)
+
+    num_gen = cfg.get("ddpp_num_gen", 1000)
+    samples = trainer.generate(num_gen)
+    samples = [s for s in samples if s]
+    gen_elapsed = time() - t0 - train_elapsed
+    print(f"  [ddpp] Generated {len(samples)} valid molecules in {gen_elapsed:.0f}s", flush=True)
+
+    # Score with FA within remaining budget
+    score_budget = timeout_sec - (time() - t0) if timeout_sec else None
+    reward_calls = 0
+    if samples and score_budget and score_budget > 0:
+        from evals.flash_affinity import run_flash_affinity
+        oracle_params = cfg.get("oracle_params", {})
+        print(f"  [ddpp] Scoring {len(samples)} mols ({score_budget:.0f}s remaining)...", flush=True)
+        scores = run_flash_affinity(samples, **oracle_params)
+        reward_calls = len(samples)
+    else:
+        scores = [None] * len(samples)
+
+    total_elapsed = time() - t0
+
+    metrics = {
+        "method": method["name"],
+        "sampler": "uncond",
+        "finetune": "ddpp",
+        "guide_reward": guide_name,
+        "wall_sec": round(total_elapsed, 2),
+        "train_sec": round(train_elapsed, 2),
+        "train_steps": trainer.global_step,
+        "reward_calls": reward_calls,
+        "forward_passes": 0,
+        **compute_metrics(samples),
+        "num_samples": len(samples),
+    }
+    metrics["_scores"] = scores
+    if hasattr(trainer, "trajectory"):
+        metrics["_trajectory"] = trainer.trajectory
+    return samples, metrics
+
+
+# ── Oracle (per-call timeline logging) ─────────────────────────────────────────
 
 def make_oracle_fn(oracle_name, oracle_params):
-    """Return a callable: smiles -> float | None."""
+    """Return a callable: smiles -> float | None (scores one molecule at a time)."""
     if oracle_name == "flash_affinity":
-        from genmol.rewards.flash_affinity import FlashAffinityForwardOp
-        model = FlashAffinityForwardOp(**oracle_params)
-        def _score(smi):
-            t = model([smi])
-            v = t[0].item()
-            return v if v != 0.0 else None
-        return _score
+        try:
+            from genmol.rewards.flash_affinity import FlashAffinityForwardOp
+            model = FlashAffinityForwardOp(**oracle_params)
+            def _score_fa(smi):
+                t = model([smi])
+                v = t[0].item()
+                return v if v != 0.0 else None
+            return _score_fa
+        except Exception:
+            pass
+        # Fallback: wrap batch scorer
+        from evals.flash_affinity import run_flash_affinity
+        def _score_fa_batch(smi):
+            results = run_flash_affinity([smi], **oracle_params)
+            return results[0] if results else None
+        return _score_fa_batch
 
     elif oracle_name == "boltz":
         from genmol.rewards.boltz import BoltzAffinityReward
         model = BoltzAffinityReward(**oracle_params)
-        def _score(smi):
+        def _score_boltz(smi):
             t = model([smi])
             v = t[0].item()
             return v if v != 0.0 else None
-        return _score
+        return _score_boltz
 
     else:
-        raise ValueError(f"Unknown oracle: {oracle_name}")
+        raise ValueError(f"Unknown oracle: {oracle_name}. Supported: flash_affinity, boltz")
 
 
-def run_oracle_with_timeline(oracle_fn, samples, timeline_path, t_experiment_start):
-    """Score samples one-by-one, logging a timeline entry after each call.
+def run_oracle_with_timeline(oracle_fn, samples, timeline_path, t_experiment_start,
+                             higher_is_better=True):
+    """Score samples one-by-one, logging a JSONL timeline entry after each call.
 
-    Timeline entry (JSONL):
-        call          -- cumulative oracle call index (1-based)
-        smiles        -- molecule evaluated
-        score         -- oracle score (null if failed)
-        best_so_far   -- best score seen so far (lower = better for affinity)
-        top10_scores  -- running list of top-10% scores
-        top10_mean    -- mean of top-10% so far
-        wall_sec      -- seconds since experiment start
+    Timeline entry fields:
+        call             -- cumulative oracle call index (1-based)
+        smiles           -- molecule evaluated
+        score            -- oracle score (null if failed)
+        best_so_far      -- best score seen so far
+        top10_mean       -- mean of running top-10% scores
+        wall_sec_before  -- seconds since experiment start (before oracle call)
+        wall_sec_after   -- seconds since experiment start (after oracle call)
 
     The timeline can be subsampled at stride N post-hoc to simulate an oracle
     that costs N times more per call.
     """
     timeline = []
-    all_scores = []          # all valid scores so far
+    all_scores = []
     call_idx = 0
 
-    # load existing timeline if resuming
+    # Resume from existing timeline if present
     if os.path.exists(timeline_path):
         with open(timeline_path) as f:
             for line in f:
@@ -192,31 +385,30 @@ def run_oracle_with_timeline(oracle_fn, samples, timeline_path, t_experiment_sta
     for smi in samples:
         if not smi:
             continue
-
         call_idx += 1
 
-        # -- evaluate oracle -------------------------------------------
-        t_before = time.time() - t_experiment_start
+        t_before = time() - t_experiment_start
         score = oracle_fn(smi)
-        t_after = time.time() - t_experiment_start
+        t_after = time() - t_experiment_start
 
-        # -- update running stats --------------------------------------
         if score is not None:
             all_scores.append(score)
 
-        best_so_far = min(all_scores) if all_scores else None   # lower = better binding
-        top10_n = max(1, len(all_scores) // 10)
-        top10_mean = (
-            sum(sorted(all_scores)[:top10_n]) / top10_n
-            if all_scores else None
-        )
+        if all_scores:
+            sorted_scores = sorted(all_scores, reverse=higher_is_better)
+            best_so_far = sorted_scores[0]
+            top10_n = max(1, len(all_scores) // 10)
+            top10_mean = sum(sorted_scores[:top10_n]) / top10_n
+        else:
+            best_so_far = None
+            top10_mean = None
 
         entry = {
-            "call":         call_idx,
-            "smiles":       smi,
-            "score":        score,
-            "best_so_far":  best_so_far,
-            "top10_mean":   top10_mean,
+            "call":            call_idx,
+            "smiles":          smi,
+            "score":           score,
+            "best_so_far":     best_so_far,
+            "top10_mean":      top10_mean,
             "wall_sec_before": round(t_before, 3),
             "wall_sec_after":  round(t_after, 3),
         }
@@ -225,37 +417,38 @@ def run_oracle_with_timeline(oracle_fn, samples, timeline_path, t_experiment_sta
         fout.flush()
 
         if call_idx % 10 == 0:
-            print(f"    call {call_idx}  score={score}  best={best_so_far:.4f}"
-                  if best_so_far is not None else f"    call {call_idx}  score=None")
+            if best_so_far is not None:
+                print(f"    call {call_idx}  score={score}  best={best_so_far:.4f}")
+            else:
+                print(f"    call {call_idx}  score=None")
 
     fout.close()
 
-    # summary stats from final timeline
     valid_scores = [e["score"] for e in timeline if e["score"] is not None]
     if not valid_scores:
-        return {"oracle_mean": None, "oracle_top10": None, "oracle_max": None,
-                "oracle_best": None, "oracle_n_scored": 0}
+        return {"oracle_mean": None, "oracle_top10": None, "oracle_best": None,
+                "oracle_n_scored": 0}
 
-    sorted_scores = sorted(valid_scores)
+    sorted_scores = sorted(valid_scores, reverse=higher_is_better)
     top10_n = max(1, len(sorted_scores) // 10)
     return {
         "oracle_mean":     round(sum(valid_scores) / len(valid_scores), 4),
         "oracle_top10":    round(sum(sorted_scores[:top10_n]) / top10_n, 4),
-        "oracle_max":      round(max(valid_scores), 4),
-        "oracle_best":     round(min(valid_scores), 4),   # best binder (lower IC50)
+        "oracle_best":     round(sorted_scores[0], 4),
         "oracle_n_scored": len(valid_scores),
     }
 
 
-# ── Budget curve simulation (post-hoc) ───────────────────────────────────────
+# ── Budget curve simulation (post-hoc) ─────────────────────────────────────────
 
 def simulate_budget_curve(timeline_path, cost_multipliers=(1, 2, 5, 10, 50, 100)):
     """Read a timeline JSONL and simulate best_so_far under various cost multipliers.
 
     For multiplier N: pretend each oracle call costs N units.
-    Read off best_so_far at calls [1, 1+N, 1+2N, ...].
+    Read off best_so_far at calls [0, N, 2N, ...].
 
-    Returns list of dicts: {cost_multiplier, effective_calls, best_so_far, top10_mean}
+    Returns list of dicts: {cost_multiplier, real_calls, effective_calls,
+                             best_so_far, top10_mean, wall_sec}
     """
     timeline = []
     with open(timeline_path) as f:
@@ -267,111 +460,151 @@ def simulate_budget_curve(timeline_path, cost_multipliers=(1, 2, 5, 10, 50, 100)
         sampled = [timeline[i] for i in range(0, len(timeline), N)]
         for entry in sampled:
             results.append({
-                "cost_multiplier": N,
-                "real_calls":      entry["call"],
-                "effective_calls": entry["call"] // N,
-                "best_so_far":     entry["best_so_far"],
-                "top10_mean":      entry["top10_mean"],
-                "wall_sec":        entry.get("wall_sec_after"),
+                "cost_multiplier":  N,
+                "real_calls":       entry["call"],
+                "effective_calls":  entry["call"] // N,
+                "best_so_far":      entry["best_so_far"],
+                "top10_mean":       entry["top10_mean"],
+                "wall_sec":         entry.get("wall_sec_after"),
             })
     return results
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Main ────────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", required=True)
-    parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--skip-oracle", action="store_true")
+    parser = argparse.ArgumentParser(description="Design space comparison orchestrator.")
+    parser.add_argument("--config", required=True, help="Comparison config YAML.")
+    parser.add_argument("--dry-run", action="store_true", help="Print methods without running.")
+    parser.add_argument("--skip-oracle", action="store_true", help="Skip oracle evaluation pass.")
     parser.add_argument("--skip-generation", action="store_true",
-                        help="Skip generation, only re-run oracle on existing samples")
+                        help="Skip generation; re-run oracle on existing samples.csv files.")
     parser.add_argument("--simulate-budget", action="store_true",
-                        help="Post-hoc budget curve simulation from existing timelines")
+                        help="Post-hoc budget curve simulation from existing timelines only.")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
     name = cfg["name"]
     output_base = os.path.join(cfg.get("output_dir", "outputs/comparison"), name)
+    methods = build_methods(cfg)
 
-    samplers   = cfg.get("samplers",      ["uncond"])
-    finetunes  = cfg.get("finetune",      ["none"])
-    guides     = cfg.get("guide_rewards", ["none"])
-    oracle_name   = cfg.get("oracle")
+    budget_sec = get_budget_sec(cfg)
+    oracle_name = cfg.get("oracle")
     oracle_params = cfg.get("oracle_params", {})
-    wall_budget   = cfg.get("wall_budget_sec", None)   # None = use num_samples
 
-    grid = list(itertools.product(samplers, finetunes, guides))
     print(f"Comparison: {name}")
-    print(f"Grid: {len(grid)} combos")
-    print(f"Wall budget: {wall_budget}s" if wall_budget else "Fixed num_samples mode")
+    print(f"Methods: {len(methods)}")
+    print(f"Budget: {budget_sec}s" if budget_sec else "Budget: unlimited")
     print(f"Oracle: {oracle_name or 'none'}")
+    kl_cfg = cfg.get("kl_penalty", {})
+    if kl_cfg.get("enabled"):
+        print(f"KL penalty: lambda={kl_cfg.get('lam', 0.01)}")
 
     if args.dry_run:
-        for s, ft, g in grid:
-            print(f"  {ft}/{g}/{s}")
+        for m in methods:
+            overrides = cfg.get("sampler_overrides", {}).get(m["sampler"], {})
+            print(f"  {m['name']}  sampler={m['sampler']}  finetune={m.get('finetune','none')}  "
+                  f"guide={m.get('guide', 'none')}  overrides={overrides}")
         return
 
     # ── Budget curve simulation only ─────────────────────────────────
     if args.simulate_budget:
         multipliers = cfg.get("cost_multipliers", [1, 2, 5, 10, 50, 100])
         all_curves = []
-        for s, ft, g in grid:
-            combo_dir = os.path.join(output_base, ft, g, s)
-            tl_path = os.path.join(combo_dir, "oracle_timeline.jsonl")
+        for m in methods:
+            method_dir = os.path.join(output_base, m["name"])
+            tl_path = os.path.join(method_dir, "oracle_timeline.jsonl")
             if not os.path.exists(tl_path):
                 print(f"No timeline found: {tl_path}")
                 continue
             rows = simulate_budget_curve(tl_path, multipliers)
             for r in rows:
-                r.update({"sampler": s, "finetune": ft, "guide": g})
+                r["method"] = m["name"]
             all_curves.extend(rows)
         if all_curves:
             curve_path = os.path.join(output_base, "budget_curves.csv")
+            os.makedirs(output_base, exist_ok=True)
             pd.DataFrame(all_curves).to_csv(curve_path, index=False)
-            print(f"Budget curves saved → {curve_path}")
+            print(f"Budget curves saved -> {curve_path}")
         return
 
-    t_experiment_start = time.time()
+    t_experiment_start = time()
     model_cache = {}
     all_results = []
-    combo_samples = {}
+    method_samples = {}
 
     # ── Generation pass ───────────────────────────────────────────────
     if not args.skip_generation:
-        for s, ft, g in grid:
-            tag = f"{ft}/{g}/{s}"
-            print(f"\n{'='*60}\nRunning: {tag}\n{'='*60}")
+        for m in methods:
+            print(f"\n{'='*60}")
+            print(f"Running: {m['name']}")
+            print(f"{'='*60}")
+
             try:
-                samples, metrics = run_generation(
-                    s, ft, g, cfg, model_cache, wall_budget_sec=wall_budget
-                )
+                if m.get("finetune") == "ddpp":
+                    samples, metrics = run_ddpp_method(m, cfg, model_cache)
+                else:
+                    samples, metrics = run_inference_method(m, cfg, model_cache)
             except Exception as e:
+                import traceback
+                traceback.print_exc()
                 print(f"  FAILED: {e}")
-                all_results.append({"sampler": s, "finetune": ft, "guide_reward": g,
-                                    "error": str(e)})
+                all_results.append({"method": m["name"], "error": str(e)})
                 continue
 
-            combo_dir = os.path.join(output_base, ft, g, s)
-            os.makedirs(combo_dir, exist_ok=True)
+            method_dir = os.path.join(output_base, m["name"])
+            os.makedirs(method_dir, exist_ok=True)
             pd.DataFrame({"smiles": samples}).to_csv(
-                os.path.join(combo_dir, "samples.csv"), index=False)
-            with open(os.path.join(combo_dir, "metrics.json"), "w") as f:
+                os.path.join(method_dir, "samples.csv"), index=False)
+
+            # Save trajectory (anytime curve data)
+            traj = metrics.pop("_trajectory", None)
+            if traj:
+                pd.DataFrame(traj).to_csv(
+                    os.path.join(method_dir, "trajectory.csv"), index=False)
+
+            # Save hourly snapshots
+            snapshots = metrics.pop("_snapshots", None)
+            if snapshots:
+                for hour_label, snap_data in snapshots.items():
+                    snap_dir = os.path.join(method_dir, f"snapshot_{hour_label}")
+                    os.makedirs(snap_dir, exist_ok=True)
+                    pd.DataFrame(snap_data).to_csv(
+                        os.path.join(snap_dir, "scored_molecules.csv"), index=False)
+                    snap_scores = [d["score"] for d in snap_data if d["score"] is not None]
+                    if snap_scores:
+                        snap_scores_sorted = sorted(snap_scores, reverse=True)
+                        top10_n = max(1, len(snap_scores) // 10)
+                        snap_metrics = {
+                            "hour": hour_label,
+                            "num_molecules": len(snap_scores),
+                            "oracle_mean": round(sum(snap_scores) / len(snap_scores), 4),
+                            "oracle_top10": round(sum(snap_scores_sorted[:top10_n]) / top10_n, 4),
+                            "oracle_best": round(snap_scores_sorted[0], 4),
+                        }
+                        with open(os.path.join(snap_dir, "metrics.json"), "w") as f:
+                            json.dump(snap_metrics, f, indent=2)
+                        print(f"  Snapshot {hour_label}: {len(snap_scores)} mols, "
+                              f"best={snap_scores_sorted[0]:.4f}", flush=True)
+
+            # Drop internal keys before saving metrics.json
+            metrics.pop("_scores", None)
+            with open(os.path.join(method_dir, "metrics.json"), "w") as f:
                 json.dump(metrics, f, indent=2)
 
-            combo_samples[(s, ft, g)] = samples
+            method_samples[m["name"]] = samples
             all_results.append(metrics)
-            print(f"  {metrics['wall_sec']}s  n={metrics['n_generated']}  "
-                  f"validity={metrics['validity']:.3f}  qed={metrics['qed_mean']:.4f}")
+            print(f"  {metrics['wall_sec']}s  validity={metrics.get('validity', 0):.3f}  "
+                  f"qed={metrics.get('qed_mean', 0):.4f}  n={metrics['num_samples']}")
     else:
-        # load existing samples
-        for s, ft, g in grid:
-            combo_dir = os.path.join(output_base, ft, g, s)
-            csv_path = os.path.join(combo_dir, "samples.csv")
+        # Load existing samples from disk
+        for m in methods:
+            method_dir = os.path.join(output_base, m["name"])
+            csv_path = os.path.join(method_dir, "samples.csv")
             if os.path.exists(csv_path):
                 df = pd.read_csv(csv_path)
-                combo_samples[(s, ft, g)] = df["smiles"].dropna().tolist()
-                metrics_path = os.path.join(combo_dir, "metrics.json")
+                method_samples[m["name"]] = df["smiles"].dropna().tolist()
+                metrics_path = os.path.join(method_dir, "metrics.json")
                 if os.path.exists(metrics_path):
                     with open(metrics_path) as f:
                         all_results.append(json.load(f))
@@ -379,68 +612,71 @@ def main():
     # ── Oracle pass (per-molecule timeline) ───────────────────────────
     if oracle_name and not args.skip_oracle:
         oracle_fn = make_oracle_fn(oracle_name, oracle_params)
-        print(f"\n{'='*60}\nOracle: {oracle_name}\n{'='*60}")
+        higher_is_better = cfg.get("oracle_higher_is_better", True)
+        print(f"\n{'='*60}")
+        print(f"Oracle: {oracle_name}  higher_is_better={higher_is_better}")
+        print(f"{'='*60}")
 
-        for i, (s, ft, g) in enumerate(grid):
-            if (s, ft, g) not in combo_samples:
+        for m in methods:
+            if m["name"] not in method_samples:
                 continue
-            samples = [smi for smi in combo_samples[(s, ft, g)] if smi]
+            samples = [s for s in method_samples[m["name"]] if s]
             if not samples:
                 continue
 
-            tag = f"{ft}/{g}/{s}"
-            print(f"\n  Scoring {tag} ({len(samples)} molecules)...")
-
-            combo_dir = os.path.join(output_base, ft, g, s)
-            os.makedirs(combo_dir, exist_ok=True)
-            tl_path = os.path.join(combo_dir, "oracle_timeline.jsonl")
+            print(f"\n  Scoring {m['name']} ({len(samples)} molecules)...")
+            method_dir = os.path.join(output_base, m["name"])
+            os.makedirs(method_dir, exist_ok=True)
+            tl_path = os.path.join(method_dir, "oracle_timeline.jsonl")
 
             try:
                 om = run_oracle_with_timeline(
-                    oracle_fn, samples, tl_path, t_experiment_start
+                    oracle_fn, samples, tl_path, t_experiment_start,
+                    higher_is_better=higher_is_better,
                 )
-                # patch into all_results
+                # Patch oracle metrics into all_results
                 for r in all_results:
-                    if (r.get("sampler") == s and r.get("finetune") == ft
-                            and r.get("guide_reward") == g):
+                    if r.get("method") == m["name"]:
                         r.update(om)
                         break
-
-                combo_dir2 = os.path.join(combo_dir)
-                with open(os.path.join(combo_dir2, "metrics.json"), "w") as f:
-                    # find the matching result
-                    row = next((r for r in all_results
-                                if r.get("sampler") == s), {})
+                # Re-save metrics.json with oracle stats included
+                metrics_path = os.path.join(method_dir, "metrics.json")
+                row = next((r for r in all_results if r.get("method") == m["name"]), {})
+                with open(metrics_path, "w") as f:
                     json.dump(row, f, indent=2)
-
                 print(f"    best={om['oracle_best']}  top10={om['oracle_top10']}  "
                       f"mean={om['oracle_mean']}  n={om['oracle_n_scored']}")
             except Exception as e:
+                import traceback
+                traceback.print_exc()
                 print(f"    FAILED: {e}")
 
-        # ── Budget curve simulation ───────────────────────────────────
+        # Auto-run budget curve simulation after oracle pass
         multipliers = cfg.get("cost_multipliers", [1, 2, 5, 10, 50, 100])
         all_curves = []
-        for s, ft, g in grid:
-            combo_dir = os.path.join(output_base, ft, g, s)
-            tl_path = os.path.join(combo_dir, "oracle_timeline.jsonl")
+        for m in methods:
+            method_dir = os.path.join(output_base, m["name"])
+            tl_path = os.path.join(method_dir, "oracle_timeline.jsonl")
             if not os.path.exists(tl_path):
                 continue
             rows = simulate_budget_curve(tl_path, multipliers)
             for r in rows:
-                r.update({"sampler": s, "finetune": ft, "guide": g})
+                r["method"] = m["name"]
             all_curves.extend(rows)
         if all_curves:
             curve_path = os.path.join(output_base, "budget_curves.csv")
             pd.DataFrame(all_curves).to_csv(curve_path, index=False)
-            print(f"\nBudget curves → {curve_path}")
+            print(f"\nBudget curves -> {curve_path}")
 
     # ── Summary ───────────────────────────────────────────────────────
     summary = pd.DataFrame(all_results)
     os.makedirs(output_base, exist_ok=True)
     summary_path = os.path.join(output_base, "summary.csv")
     summary.to_csv(summary_path, index=False)
-    print(f"\nSummary → {summary_path}")
+
+    print(f"\n{'='*60}")
+    print(f"Summary: {len(all_results)} methods -> {summary_path}")
+    print(f"{'='*60}")
     print(summary.to_string(index=False))
 
 

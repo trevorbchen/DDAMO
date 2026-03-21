@@ -33,7 +33,6 @@ import sys
 from datetime import datetime
 from time import time
 
-import numpy as np
 import pandas as pd
 import yaml
 
@@ -123,68 +122,17 @@ def run_inference_method(method, cfg, model_cache):
     overrides = cfg.get("sampler_overrides", {}).get(sampler_name, {})
     sampler = cls(model=model, forward_op=forward_op, **overrides)
 
-    # Generate
+    # Generate — all methods just generate molecules; oracle scoring happens separately
     start_ts = datetime.now().isoformat()
     t0 = time()
 
-    is_baseline = forward_op is None
-
-    # Baseline: interleave generate + score until budget runs out
-    baseline_scores = None
-    baseline_reward_calls = 0
-    baseline_trajectory = []
-    scored_pool_with_time = []
-    if is_baseline and timeout_sec is not None:
-        from evals.flash_affinity import run_flash_affinity
-        oracle_params = cfg.get("oracle_params", {})
-        BATCH = 256
-        scored_pool = []  # list of (score, smiles)
-        best_so_far = float("-inf")
-        cycle = 0
-        while time() - t0 < timeout_sec:
-            cycle += 1
-            batch_smiles = sampler.de_novo_generation(
-                BATCH,
-                softmax_temp=cfg.get("softmax_temp", 1.0),
-                randomness=cfg.get("randomness", 0.3),
-                min_add_len=cfg.get("min_add_len", 60),
-            )
-            if time() - t0 >= timeout_sec:
-                break
-            scores = run_flash_affinity(batch_smiles, **oracle_params)
-            baseline_reward_calls += len(batch_smiles)
-            wall = time() - t0
-            for smi, sc in zip(batch_smiles, scores):
-                if sc is not None:
-                    scored_pool.append((sc, smi))
-                    scored_pool_with_time.append((sc, smi, wall))
-                    if sc > best_so_far:
-                        best_so_far = sc
-            baseline_trajectory.append({
-                "wall_sec": time() - t0,
-                "reward_calls": baseline_reward_calls,
-                "best_reward": best_so_far,
-            })
-            best = max(scored_pool, key=lambda x: x[0])[0] if scored_pool else 0
-            print(f"  [baseline] cycle {cycle}: {len(scored_pool)} scored, "
-                  f"best={best:.4f}, {time()-t0:.0f}s/{timeout_sec}s", flush=True)
-        # Sort best-first, deduplicate
-        scored_pool.sort(reverse=True)
-        seen = set()
-        samples, baseline_scores = [], []
-        for sc, smi in scored_pool:
-            if smi not in seen:
-                seen.add(smi)
-                samples.append(smi)
-                baseline_scores.append(sc)
-    else:
-        samples = sampler.de_novo_generation(
-            cfg.get("num_samples", 100),
-            softmax_temp=cfg.get("softmax_temp", 1.0),
-            randomness=cfg.get("randomness", 0.3),
-            min_add_len=cfg.get("min_add_len", 60),
-            timeout_sec=timeout_sec,
-        )
+    samples = sampler.de_novo_generation(
+        cfg.get("num_samples", 100),
+        softmax_temp=cfg.get("softmax_temp", 1.0),
+        randomness=cfg.get("randomness", 0.3),
+        min_add_len=cfg.get("min_add_len", 60),
+        timeout_sec=timeout_sec,
+    )
 
     elapsed = time() - t0
     end_ts = datetime.now().isoformat()
@@ -198,36 +146,12 @@ def run_inference_method(method, cfg, model_cache):
         "start_time": start_ts,
         "end_time": end_ts,
         "wall_sec": round(elapsed, 2),
-        "reward_calls": baseline_reward_calls or getattr(sampler, "last_reward_evals", 0),
+        "reward_calls": getattr(sampler, "last_reward_evals", 0),
         "forward_passes": getattr(sampler, "last_forward_passes", 0),
         **{k: m[k] for k in ("validity", "uniqueness", "qed_mean", "qed_top10", "qed_max")},
         "num_samples": len(samples),
         **{f"sampler_{k}": v for k, v in overrides.items()},
     }
-    if baseline_scores is not None:
-        metrics["_scores"] = baseline_scores
-    if not is_baseline and hasattr(sampler, "trajectory"):
-        metrics["_trajectory"] = sampler.trajectory
-    if not is_baseline and hasattr(sampler, "snapshots"):
-        metrics["_snapshots"] = sampler.snapshots
-    if is_baseline and scored_pool_with_time:
-        metrics["_trajectory"] = baseline_trajectory
-        # Build baseline snapshots from scored_pool_with_time
-        baseline_snapshots = {}
-        for hr in range(1, 10):
-            cutoff = hr * 3600
-            pool_at_hr = [(sc, smi) for sc, smi, w in scored_pool_with_time if w <= cutoff]
-            if pool_at_hr:
-                pool_at_hr.sort(reverse=True)
-                seen = set()
-                snap = []
-                for sc, smi in pool_at_hr:
-                    if smi not in seen:
-                        seen.add(smi)
-                        snap.append({"smiles": smi, "score": sc})
-                baseline_snapshots[f"{hr}hr"] = snap
-        if baseline_snapshots:
-            metrics["_snapshots"] = baseline_snapshots
     return samples, metrics
 
 
@@ -308,9 +232,6 @@ def run_ddpp_method(method, cfg, model_cache):
         **compute_metrics(samples),
         "num_samples": len(samples),
     }
-    metrics["_scores"] = scores
-    if hasattr(trainer, "trajectory"):
-        metrics["_trajectory"] = trainer.trajectory
     return samples, metrics
 
 
@@ -556,39 +477,6 @@ def main():
             os.makedirs(method_dir, exist_ok=True)
             pd.DataFrame({"smiles": samples}).to_csv(
                 os.path.join(method_dir, "samples.csv"), index=False)
-
-            # Save trajectory (anytime curve data)
-            traj = metrics.pop("_trajectory", None)
-            if traj:
-                pd.DataFrame(traj).to_csv(
-                    os.path.join(method_dir, "trajectory.csv"), index=False)
-
-            # Save hourly snapshots
-            snapshots = metrics.pop("_snapshots", None)
-            if snapshots:
-                for hour_label, snap_data in snapshots.items():
-                    snap_dir = os.path.join(method_dir, f"snapshot_{hour_label}")
-                    os.makedirs(snap_dir, exist_ok=True)
-                    pd.DataFrame(snap_data).to_csv(
-                        os.path.join(snap_dir, "scored_molecules.csv"), index=False)
-                    snap_scores = [d["score"] for d in snap_data if d["score"] is not None]
-                    if snap_scores:
-                        snap_scores_sorted = sorted(snap_scores, reverse=True)
-                        top10_n = max(1, len(snap_scores) // 10)
-                        snap_metrics = {
-                            "hour": hour_label,
-                            "num_molecules": len(snap_scores),
-                            "oracle_mean": round(sum(snap_scores) / len(snap_scores), 4),
-                            "oracle_top10": round(sum(snap_scores_sorted[:top10_n]) / top10_n, 4),
-                            "oracle_best": round(snap_scores_sorted[0], 4),
-                        }
-                        with open(os.path.join(snap_dir, "metrics.json"), "w") as f:
-                            json.dump(snap_metrics, f, indent=2)
-                        print(f"  Snapshot {hour_label}: {len(snap_scores)} mols, "
-                              f"best={snap_scores_sorted[0]:.4f}", flush=True)
-
-            # Drop internal keys before saving metrics.json
-            metrics.pop("_scores", None)
             with open(os.path.join(method_dir, "metrics.json"), "w") as f:
                 json.dump(metrics, f, indent=2)
 

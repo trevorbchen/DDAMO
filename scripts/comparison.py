@@ -252,7 +252,7 @@ def run_mcts_surrogate_method(method, cfg, model_cache, oracle_fn,
     Returns (oracle_scored_smiles, metrics) with metrics["oracle_logged"]=True
     so the standard oracle pass skips this method.
     """
-    from genmol.surrogate import FingerprintSurrogate
+    from genmol.surrogate import SequenceSurrogate
     from genmol.finetune import DDPPLBTrainer
     import random as _random
 
@@ -270,7 +270,7 @@ def run_mcts_surrogate_method(method, cfg, model_cache, oracle_fn,
     top_frac = active_cfg.get("top_frac", 0.2)           # fraction sent to oracle
     ddpp_steps_per_epoch = active_cfg.get("ddpp_steps_per_epoch", 50)
 
-    surrogate = FingerprintSurrogate()
+    surrogate = SequenceSurrogate()
 
     # DDPP trainer uses surrogate as reward — since surrogate is updated in-place,
     # the DDPP loss always reflects the latest surrogate knowledge.

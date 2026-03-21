@@ -44,7 +44,7 @@ from genmol.samplers import (
     Sampler, BeamSearchSampler, MCTSSampler, SMCSampler, DFKCSampler, DAPSSampler,
     load_model_from_path, decode_smiles,
 )
-from genmol.rewards import get_reward, KLPenalizedReward
+from genmol.rewards import get_reward, KLPenalizedReward, ThresholdReward
 from genmol.model_loader import merge_ddpp_checkpoint
 from evals.metrics import compute_metrics
 
@@ -235,6 +235,269 @@ def run_ddpp_method(method, cfg, model_cache):
     return samples, metrics
 
 
+# ── MCTS + surrogate active learning loop ──────────────────────────────────────
+
+def run_mcts_surrogate_method(method, cfg, model_cache, oracle_fn,
+                              timeline_path, t_experiment_start,
+                              higher_is_better=True):
+    """Active learning: MCTS guided by surrogate + online surrogate/model update.
+
+    Each epoch:
+      1. Generate candidates with MCTS (surrogate as forward_op once fitted)
+      2. Score all candidates with surrogate, keep top 20%
+      3. Oracle-score top 20% one-by-one (logged to timeline)
+      4. Retrain surrogate on all accumulated oracle labels
+      5. Run DDPP gradient steps to fine-tune the generative model
+
+    Returns (oracle_scored_smiles, metrics) with metrics["oracle_logged"]=True
+    so the standard oracle pass skips this method.
+    """
+    from genmol.surrogate import FingerprintSurrogate
+    from genmol.finetune import DDPPLBTrainer
+    import random as _random
+
+    timeout_sec = get_budget_sec(cfg)
+    t0 = time()
+
+    # Load base model
+    if "base" not in model_cache:
+        model_cache["base"] = load_model_from_path(os.path.realpath(cfg["model_path"]))
+    model = model_cache["base"]
+
+    overrides = cfg.get("sampler_overrides", {}).get("mcts", {})
+    active_cfg = cfg.get("mcts_surrogate", {})
+    candidates_per_epoch = active_cfg.get("candidates_per_epoch", 200)
+    top_frac = active_cfg.get("top_frac", 0.2)           # fraction sent to oracle
+    ddpp_steps_per_epoch = active_cfg.get("ddpp_steps_per_epoch", 50)
+
+    surrogate = FingerprintSurrogate()
+
+    # DDPP trainer uses surrogate as reward — since surrogate is updated in-place,
+    # the DDPP loss always reflects the latest surrogate knowledge.
+    ddpp_cfg = cfg.get("ddpp_overrides", {})
+    trainer = DDPPLBTrainer(
+        model_path=os.path.realpath(cfg["model_path"]),
+        reward_fn=surrogate,
+        lr=ddpp_cfg.get("lr", 1e-4),
+        batch_size=ddpp_cfg.get("batch_size", 16),
+        lr_logz=ddpp_cfg.get("lr_logz", 1e-3),
+        warmup_logz_steps=ddpp_cfg.get("warmup_logz_steps", 0),
+        replay_buffer_size=ddpp_cfg.get("replay_buffer_size", 10000),
+        refill_interval=0,  # we control refills manually each epoch
+        initial_buffer_from_pretrained=0,  # skip initial fill; surrogate not fitted yet
+        ema_decay=ddpp_cfg.get("ema_decay", 0.9999),
+    )
+
+    # Timeline state
+    all_oracle_smiles_scores = []  # (smiles, score)
+    call_idx = 0
+    all_scores_seen = []
+    os.makedirs(os.path.dirname(timeline_path) or ".", exist_ok=True)
+    fout = open(timeline_path, "a")
+    epoch = 0
+
+    while (time() - t0) < (timeout_sec or float("inf")):
+        epoch += 1
+        remaining = (timeout_sec - (time() - t0)) if timeout_sec else None
+        if remaining is not None and remaining < 10:
+            break
+
+        # 1. Generate candidates with MCTS
+        # Use the fine-tuned model after first epoch, base model before
+        gen_model = trainer.finetuned if epoch > 1 else model
+        mcts = MCTSSampler(
+            model=gen_model,
+            forward_op=surrogate if surrogate.is_fitted else None,
+            **overrides,
+        )
+        candidates = mcts.de_novo_generation(
+            candidates_per_epoch,
+            softmax_temp=cfg.get("softmax_temp", 1.0),
+            randomness=cfg.get("randomness", 0.3),
+            min_add_len=cfg.get("min_add_len", 60),
+        )
+        candidates = [s for s in candidates if s]
+        if not candidates:
+            continue
+
+        # 2. Score with surrogate, take top fraction
+        top_n = max(1, int(len(candidates) * top_frac))
+        if surrogate.is_fitted:
+            surr_scores = surrogate.predict(candidates)
+            ranked = sorted(zip(surr_scores, candidates),
+                            reverse=higher_is_better, key=lambda x: x[0])
+            top_candidates = [smi for _, smi in ranked[:top_n]]
+        else:
+            # No surrogate yet: random sample
+            top_candidates = _random.sample(candidates, min(top_n, len(candidates)))
+
+        # 3. Oracle-score top candidates (log to timeline)
+        epoch_oracle = []
+        for smi in top_candidates:
+            if timeout_sec and (time() - t0) >= timeout_sec:
+                break
+            call_idx += 1
+            t_before = time() - t_experiment_start
+            score = oracle_fn(smi)
+            t_after = time() - t_experiment_start
+
+            if score is not None:
+                all_scores_seen.append(score)
+                epoch_oracle.append((smi, score))
+                all_oracle_smiles_scores.append((smi, score))
+
+            if all_scores_seen:
+                sorted_ts = sorted(all_scores_seen, reverse=higher_is_better)
+                best_so_far = sorted_ts[0]
+                top10_n = max(1, len(all_scores_seen) // 10)
+                top10_mean = sum(sorted_ts[:top10_n]) / top10_n
+            else:
+                best_so_far = top10_mean = None
+
+            entry = {
+                "call":            call_idx,
+                "smiles":          smi,
+                "score":           score,
+                "best_so_far":     best_so_far,
+                "top10_mean":      top10_mean,
+                "wall_sec_before": round(t_before, 3),
+                "wall_sec_after":  round(t_after, 3),
+            }
+            fout.write(json.dumps(entry) + "\n")
+            fout.flush()
+
+        # 4. Retrain surrogate on all accumulated oracle data
+        if all_oracle_smiles_scores:
+            smiles_fit = [s for s, _ in all_oracle_smiles_scores]
+            scores_fit = [sc for _, sc in all_oracle_smiles_scores]
+            surrogate.fit(smiles_fit, scores_fit)
+
+        # 5. DDPP gradient steps (fine-tune generative model via updated surrogate)
+        if surrogate.is_fitted and epoch_oracle:
+            trainer._fill_buffer(trainer.finetuned, ddpp_cfg.get("batch_size", 16),
+                                  label=f"epoch-{epoch}-onpolicy")
+            for _ in range(ddpp_steps_per_epoch):
+                if timeout_sec and (time() - t0) >= timeout_sec:
+                    break
+                trainer.train_step()
+
+        best = all_scores_seen[0] if all_scores_seen else None
+        if all_scores_seen:
+            best = sorted(all_scores_seen, reverse=higher_is_better)[0]
+        print(f"  [mcts_surrogate] epoch {epoch}: {len(epoch_oracle)} oracle calls, "
+              f"best={best}, surrogate_pts={len(all_oracle_smiles_scores)}, "
+              f"{time()-t0:.0f}s/{timeout_sec}s", flush=True)
+
+    fout.close()
+
+    all_oracle_smiles = [s for s, _ in all_oracle_smiles_scores]
+    valid_scores = [sc for _, sc in all_oracle_smiles_scores if sc is not None]
+    if valid_scores:
+        sorted_vs = sorted(valid_scores, reverse=higher_is_better)
+        top10_n = max(1, len(valid_scores) // 10)
+        om = {
+            "oracle_mean":     round(sum(valid_scores) / len(valid_scores), 4),
+            "oracle_top10":    round(sum(sorted_vs[:top10_n]) / top10_n, 4),
+            "oracle_best":     round(sorted_vs[0], 4),
+            "oracle_n_scored": len(valid_scores),
+        }
+    else:
+        om = {"oracle_mean": None, "oracle_top10": None,
+              "oracle_best": None, "oracle_n_scored": 0}
+
+    metrics = {
+        "method":        method["name"],
+        "sampler":       "mcts",
+        "finetune":      "mcts_surrogate",
+        "guide_reward":  "surrogate",
+        "wall_sec":      round(time() - t0, 2),
+        "reward_calls":  call_idx,
+        "num_samples":   len(all_oracle_smiles),
+        "surrogate_pts": len(all_oracle_smiles_scores),
+        "oracle_logged": True,
+        **om,
+    }
+    return all_oracle_smiles, metrics
+
+
+# ── DDPP with threshold reward ──────────────────────────────────────────────────
+
+def run_threshold_ddpp_method(method, cfg, model_cache):
+    """DDPP fine-tuning with max(r(x)-t, 0) reward.
+
+    Wraps the oracle reward with ThresholdReward before passing to DDPPLBTrainer.
+    t = 80th percentile of all rewards seen, updated every 10 batch calls.
+    Only top-20% molecules get positive reward, focusing training on the best candidates.
+
+    Otherwise identical to run_ddpp_method.
+    """
+    from genmol.rewards import ThresholdReward
+
+    timeout_sec = get_budget_sec(cfg)
+    ddpp_cfg = cfg.get("ddpp_overrides", {})
+    threshold_cfg = cfg.get("threshold_reward", {})
+
+    if "base" not in model_cache:
+        model_cache["base"] = load_model_from_path(os.path.realpath(cfg["model_path"]))
+
+    guide_name = method.get("guide", "none")
+    if guide_name in ("none", None, ""):
+        oracle_name = cfg.get("oracle", "flash_affinity")
+        base_reward_fn = get_reward(oracle_name, **cfg.get("oracle_params", {}))
+    else:
+        base_reward_fn = get_reward(guide_name, **cfg.get("guide_reward_params", {}))
+
+    # Wrap with threshold
+    reward_fn = ThresholdReward(
+        base_reward_fn,
+        update_every=threshold_cfg.get("update_every", 10),
+        percentile=threshold_cfg.get("percentile", 80.0),
+        min_samples=threshold_cfg.get("min_samples", 20),
+    )
+
+    model_path = os.path.realpath(cfg["model_path"])
+    from genmol.finetune import DDPPLBTrainer
+    trainer = DDPPLBTrainer(
+        model_path=model_path,
+        reward_fn=reward_fn,
+        lr=ddpp_cfg.get("lr", 1e-4),
+        batch_size=ddpp_cfg.get("batch_size", 16),
+        lr_logz=ddpp_cfg.get("lr_logz", 1e-3),
+        warmup_logz_steps=ddpp_cfg.get("warmup_logz_steps", 500),
+        replay_buffer_size=ddpp_cfg.get("replay_buffer_size", 10000),
+        refill_interval=ddpp_cfg.get("refill_interval", 250),
+        ema_decay=ddpp_cfg.get("ema_decay", 0.9999),
+    )
+
+    t0 = time()
+    train_budget = timeout_sec * 0.85 if timeout_sec else None
+    max_steps = ddpp_cfg.get("num_steps", 10000)
+    trainer.train(max_steps, timeout_sec=train_budget)
+    train_elapsed = time() - t0
+    print(f"  [ddpp_threshold] Training done: {train_elapsed:.0f}s, "
+          f"{trainer.global_step} steps, threshold={reward_fn.threshold:.4f}", flush=True)
+
+    num_gen = cfg.get("ddpp_num_gen", 1000)
+    samples = trainer.generate(num_gen)
+    samples = [s for s in samples if s]
+
+    metrics = {
+        "method":        method["name"],
+        "sampler":       "uncond",
+        "finetune":      "ddpp_threshold",
+        "guide_reward":  guide_name,
+        "wall_sec":      round(time() - t0, 2),
+        "train_sec":     round(train_elapsed, 2),
+        "train_steps":   trainer.global_step,
+        "reward_threshold": round(reward_fn.threshold, 4),
+        "reward_calls":  0,
+        "forward_passes": 0,
+        **compute_metrics(samples),
+        "num_samples":   len(samples),
+    }
+    return samples, metrics
+
+
 # ── Oracle (per-call timeline logging) ─────────────────────────────────────────
 
 def make_oracle_fn(oracle_name, oracle_params):
@@ -412,6 +675,7 @@ def main():
     budget_sec = get_budget_sec(cfg)
     oracle_name = cfg.get("oracle")
     oracle_params = cfg.get("oracle_params", {})
+    higher_is_better = cfg.get("oracle_higher_is_better", True)
 
     print(f"Comparison: {name}")
     print(f"Methods: {len(methods)}")
@@ -462,7 +726,22 @@ def main():
             print(f"{'='*60}")
 
             try:
-                if m.get("finetune") == "ddpp":
+                finetune = m.get("finetune", "none")
+                if finetune == "mcts_surrogate":
+                    if not oracle_name:
+                        raise ValueError("mcts_surrogate requires an oracle in config")
+                    oracle_fn_al = make_oracle_fn(oracle_name, oracle_params)
+                    method_dir_al = os.path.join(output_base, m["name"])
+                    os.makedirs(method_dir_al, exist_ok=True)
+                    tl_path_al = os.path.join(method_dir_al, "oracle_timeline.jsonl")
+                    samples, metrics = run_mcts_surrogate_method(
+                        m, cfg, model_cache, oracle_fn_al,
+                        tl_path_al, t_experiment_start,
+                        higher_is_better=higher_is_better,
+                    )
+                elif finetune == "ddpp_threshold":
+                    samples, metrics = run_threshold_ddpp_method(m, cfg, model_cache)
+                elif finetune == "ddpp":
                     samples, metrics = run_ddpp_method(m, cfg, model_cache)
                 else:
                     samples, metrics = run_inference_method(m, cfg, model_cache)
@@ -500,13 +779,16 @@ def main():
     # ── Oracle pass (per-molecule timeline) ───────────────────────────
     if oracle_name and not args.skip_oracle:
         oracle_fn = make_oracle_fn(oracle_name, oracle_params)
-        higher_is_better = cfg.get("oracle_higher_is_better", True)
         print(f"\n{'='*60}")
         print(f"Oracle: {oracle_name}  higher_is_better={higher_is_better}")
         print(f"{'='*60}")
 
         for m in methods:
             if m["name"] not in method_samples:
+                continue
+            # Skip methods that logged their own oracle timeline (e.g. mcts_surrogate)
+            method_result = next((r for r in all_results if r.get("method") == m["name"]), {})
+            if method_result.get("oracle_logged"):
                 continue
             samples = [s for s in method_samples[m["name"]] if s]
             if not samples:

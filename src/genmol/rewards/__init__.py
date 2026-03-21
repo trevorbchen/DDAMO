@@ -13,6 +13,7 @@ Registry:
     >>> reward = get_reward("flash_affinity", protein_id="2VT4")
 """
 
+from .threshold import ThresholdReward
 from .properties import (
     RewardFunction,
     MolecularWeightReward,
@@ -75,4 +76,5 @@ __all__ = [
     "QEDForwardOp",
     "REWARD_REGISTRY",
     "get_reward",
+    "ThresholdReward",
 ]

@@ -416,14 +416,25 @@ class DDPPLBTrainer:
 
     # ── main training loop ──────────────────────────────────────────
 
-    def train(self, num_steps: int):
-        """Run the full DDPP-LB fine-tuning loop."""
+    def train(self, num_steps: int, timeout_sec: float = None):
+        """Run the full DDPP-LB fine-tuning loop.
+
+        Args:
+            num_steps:   maximum gradient steps.
+            timeout_sec: wall-clock budget in seconds; stops early if exceeded.
+        """
+        import time as _time
+        t0 = _time.time()
+
         # seed buffer from pre-trained model
         n_init = max(self.initial_buffer_from_pretrained, self.batch_size * 2)
         logger.info("Seeding replay buffer from pre-trained model (%d) …", n_init)
         self._fill_buffer(self.pretrained, n_init, label="init-pretrained")
 
         for step in range(1, num_steps + 1):
+            if timeout_sec is not None and (_time.time() - t0) >= timeout_sec:
+                logger.info("Training timeout at step %d (%.1fs)", step, timeout_sec)
+                break
             metrics = self.train_step()
             if metrics is None:
                 logger.warning("Buffer too small, skipping step %d", step)

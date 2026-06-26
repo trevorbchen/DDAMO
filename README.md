@@ -151,6 +151,12 @@ python scripts/plot_fig9_compute.py       # compute-efficiency analysis
 
 ---
 
+## Results
+
+Experimental results (oracle timelines, scored molecule CSVs) for all runs across ~200 experimental configurations are available on [HuggingFace](https://huggingface.co/trevorbchen/DDAMO).
+
+---
+
 ## License
 
 MIT License. See [LICENSE](LICENSE).

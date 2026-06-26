@@ -1,6 +1,7 @@
-# Genesis Discovery Harness
+# Discrete Diffusion Adaptation for Molecular Optimization
 
-Code for the paper **"Evaluating the Design Space of Test-Time Scaling for Molecular Optimization with Discrete Diffusion"** (NeurIPS 2026 submission).
+Code for the paper **"On the Design Space of Discrete Diffusion Online
+Adaptation for Molecular Optimization"**.
 
 We benchmark inference-time search and test-time fine-tuning strategies built on top of [GenMol](https://github.com/arielyyd/genmol), a masked discrete-diffusion model over SAFE molecular representations. The oracle throughout is [FlashAffinity](https://github.com/BIMSBbioinfo/FlashAffinity) (FA), a fast binary-head binding classifier, evaluated across six protein pockets.
 

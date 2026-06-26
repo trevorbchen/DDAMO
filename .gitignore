@@ -27,3 +27,21 @@ MANIFEST
 outputs/
 mh_visualizations/
 *.log
+
+# Run outputs and temp files
+runs/
+wandb/
+tmp*/
+*.ipynb
+logs/
+final_graphs/
+
+# Model checkpoints (large binaries)
+model.ckpt
+model_v2.ckpt
+
+# Local data / protein ESM3 reprs (user-provided)
+FlashAffinity/data/protein_test/repr/
+
+# Paper-specific plotting scripts (local only, not pushed)
+paper_scripts/

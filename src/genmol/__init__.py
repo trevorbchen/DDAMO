@@ -28,3 +28,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from genmol.base_model import GenerativeModel, FinetuneTrainer
+from genmol.rewards import get_reward, register_reward
+
+__all__ = [
+    GenerativeModel,
+    FinetuneTrainer,
+    get_reward,
+    register_reward,
+]

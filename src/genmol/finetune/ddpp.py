@@ -1,605 +1,708 @@
-"""DDPP-LB: Discrete Denoising Posterior Prediction (Lower Bound) for GenMol.
+"""
+DDPP-LB (Denoising Diffusion Policy Posterior — Lower Bound variant).
 
-Implements Algorithm 1 from "Steering Masked Discrete Diffusion Models
-via Discrete Denoising Posterior Prediction" (Rector-Brooks et al., 2024).
+Loss (per batch):
+    L(θ, φ) = E_t E_{x0~buffer} E_{xt~p(xt|x0,t)} [
+        (log q_θ(x0|xt) − log p_pre(x0|xt) − (1/β)·log R(x0) + log Ẑ_φ(xt, t))²
+    ]
 
-Fine-tunes a pre-trained GenMol masked diffusion model to sample from the
-reward-induced Bayesian posterior: π₀(x₀) ∝ p_pre(x₀) · R(x₀)^{1/β}
+Both θ (finetuned backbone) and φ (LogZNetwork) are trained jointly.
+p_pre is the pretrained model and stays frozen throughout.
+log Ẑ_φ is a learned slack variable that absorbs the per-(xt,t) normalisation
+constant; it is NOT a value/quality predictor.
 
-Usage:
-    from genmol.ddpp_trainer import DDPPLBTrainer
-    from genmol.rewards import get_reward
-
-    trainer = DDPPLBTrainer(
-        model_path="model_v2.ckpt",
-        reward_fn=get_reward("qed"),
-        beta=0.25,
-    )
-    trainer.train(num_steps=5000)
-    trainer.save("ddpp_finetuned.pt")
+Reference: https://arxiv.org/pdf/2410.08134
 """
 
 import copy
-import logging
-import os
+import itertools
 import random
 from collections import deque
+from time import time
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.optim import Adam
 
-from genmol.samplers.base import load_model_from_path
-from genmol.utils.utils_chem import safe_to_smiles
-from genmol.utils.bracket_safe_converter import bracketsafe2safe
-
-logger = logging.getLogger(__name__)
+from genmol.utils.ema import ExponentialMovingAverage
 
 
-# ── Log partition function network ────────────────────────────────────
-
+# ---------------------------------------------------------------------------
+# LogZ network  φ: (x_t, t) → scalar log Ẑ
+# ---------------------------------------------------------------------------
 
 class LogZNetwork(nn.Module):
-    """Small network to estimate log Z_πt(xt).
-
-    Takes a partially masked token sequence xt and diffusion time t,
-    outputs a scalar log partition function estimate.  Architecture is
-    a lightweight transformer encoder (2 layers) followed by mean-pool
-    and a linear head.
     """
+    Lightweight transformer encoder that maps a noisy sequence x_t and
+    diffusion time t to a scalar log partition estimate log Ẑ.
 
-    def __init__(self, vocab_size, embed_dim=128, hidden_dim=256,
-                 n_heads=4, n_layers=2, max_len=256):
-        super().__init__()
-        self.tok_embed = nn.Embedding(vocab_size, embed_dim)
-        self.pos_embed = nn.Embedding(max_len, embed_dim)
-        self.time_proj = nn.Linear(1, embed_dim)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=embed_dim, nhead=n_heads,
-            dim_feedforward=hidden_dim, batch_first=True,
-            dropout=0.1, activation="gelu",
-        )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
-        self.head = nn.Sequential(
-            nn.Linear(embed_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, 1),
-        )
-
-    def forward(self, xt, t, padding_mask=None):
-        """
-        Args:
-            xt: [B, L] token IDs (partially masked)
-            t:  [B] diffusion time in (0, 1)
-            padding_mask: [B, L] bool, True = pad (ignored positions)
-        Returns:
-            [B] scalar log-partition-function estimates
-        """
-        B, L = xt.shape
-        positions = torch.arange(L, device=xt.device).unsqueeze(0).expand(B, -1)
-        h = self.tok_embed(xt) + self.pos_embed(positions)
-        h = h + self.time_proj(t.unsqueeze(-1)).unsqueeze(1)  # broadcast time
-        if padding_mask is not None:
-            h = self.encoder(h, src_key_padding_mask=padding_mask)
-        else:
-            h = self.encoder(h)
-        # mean-pool over non-padding positions
-        if padding_mask is not None:
-            mask_float = (~padding_mask).float().unsqueeze(-1)  # [B, L, 1]
-            h = (h * mask_float).sum(dim=1) / mask_float.sum(dim=1).clamp(min=1)
-        else:
-            h = h.mean(dim=1)
-        return self.head(h).squeeze(-1)  # [B]
-
-
-# ── Replay buffer ─────────────────────────────────────────────────────
-
-
-class ReplayBuffer:
-    """Stores tokenised molecule sequences for off-policy DDPP-LB training."""
-
-    def __init__(self, max_size=10_000):
-        self.buffer = deque(maxlen=max_size)
-
-    def add_batch(self, token_ids, attention_masks, smiles_list, rewards):
-        """Add a batch of valid samples."""
-        for i in range(token_ids.shape[0]):
-            self.buffer.append({
-                "token_ids": token_ids[i].cpu(),
-                "attention_mask": attention_masks[i].cpu(),
-                "smiles": smiles_list[i],
-                "reward": rewards[i].item(),
-            })
-
-    def sample(self, batch_size):
-        """Sample a mini-batch, returned as stacked tensors."""
-        items = random.sample(list(self.buffer),
-                              min(batch_size, len(self.buffer)))
-        token_ids = torch.stack([it["token_ids"] for it in items])
-        att_mask = torch.stack([it["attention_mask"] for it in items])
-        smiles = [it["smiles"] for it in items]
-        rewards = torch.tensor([it["reward"] for it in items],
-                               dtype=torch.float32)
-        return token_ids, att_mask, smiles, rewards
-
-    def __len__(self):
-        return len(self.buffer)
-
-
-# ── DDPP-LB Trainer ───────────────────────────────────────────────────
-
-
-class DDPPLBTrainer:
-    """Fine-tune a GenMol MDM via DDPP-LB.
-
-    The single-step DDPP-LB loss (paper Eq. 11, Algorithm 1) is:
-
-        L = || log q_θ(x₀|xₜ) − log p_pre(x₀|xₜ) − (1/β)·log R(x₀) + log Ẑ_πt(xₜ) ||²
-
-    where q_θ is the fine-tuned denoiser, p_pre is the frozen pre-trained
-    model, R is the reward function, and Ẑ is a learned log-partition
-    function (lower-bound estimator).
+    Architecture:
+        token_emb(x_t)  +  time_proj(t)   →  TransformerEncoder  →  mean-pool  →  linear  →  scalar
     """
 
     def __init__(
         self,
-        model_path: str,
-        reward_fn,
-        *,
-        lr: float = 1e-4,
-        lr_logz: float = 1e-3,
-        batch_size: int = 16,
-        beta: float = 1.0,
-        replay_buffer_size: int = 10_000,
-        warmup_logz_steps: int = 0,
-        sampling_eps: float = 1e-3,
-        refill_interval: int = 250,
-        refill_batch_size: int = 16,
-        initial_buffer_from_pretrained: int = 64,
-        softmax_temp: float = 0.8,
-        randomness: float = 0.5,
-        min_add_len: int = 60,
-        ema_decay: float = 0.9999,
-        logz_embed_dim: int = 128,
-        logz_hidden_dim: int = 256,
-        seed: int | None = 0,
-        verbose: bool = False,
+        vocab_size: int,
+        d_model: int = 256,
+        nhead: int = 4,
+        num_layers: int = 2,
+        dim_feedforward: int = 1024,
+        dropout: float = 0.0,
     ):
-        if seed is not None:
-            torch.manual_seed(seed)
-            random.seed(seed)
-
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-        # ── models ──────────────────────────────────────────────────
-        logger.info("Loading pre-trained model (frozen) …")
-        self.pretrained = load_model_from_path(model_path)
-        self.pretrained.backbone.eval()
-        for p in self.pretrained.parameters():
-            p.requires_grad_(False)
-        self.pretrained.to(self.device)
-
-        logger.info("Loading fine-tuned model (trainable) …")
-        self.finetuned = load_model_from_path(model_path)
-        self.finetuned.backbone.train()
-        self.finetuned.to(self.device)
-
-        # shared references
-        self.mdlm = self.pretrained.mdlm
-        self.mdlm.to_device(self.device)
-        self.tokenizer = self.pretrained.tokenizer
-        self.mask_idx = self.pretrained.mask_index
-        self.pad_idx = self.tokenizer.pad_token_id
-        self.bos_idx = self.pretrained.bos_index
-        self.eos_idx = self.pretrained.eos_index
-        # actual vocab = tokenizer + any added tokens; use the embedding size
-        self.vocab_size = self.pretrained.backbone.bert.embeddings.word_embeddings.num_embeddings
-        self.max_len = self.pretrained.config.model.max_position_embeddings
-        self.use_bracket_safe = self.pretrained.config.training.get(
-            "use_bracket_safe", False
+        super().__init__()
+        self.token_emb = nn.Embedding(vocab_size, d_model)
+        self.time_proj = nn.Sequential(
+            nn.Linear(1, d_model),
+            nn.SiLU(),
+            nn.Linear(d_model, d_model),
         )
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.out = nn.Linear(d_model, 1)
 
-        # ── log-Z network ──────────────────────────────────────────
-        self.log_z_net = LogZNetwork(
-            vocab_size=self.vocab_size,
-            embed_dim=logz_embed_dim,
-            hidden_dim=logz_hidden_dim,
-            max_len=self.max_len,
-        ).to(self.device)
-
-        # ── reward / temperature ────────────────────────────────────
-        self.reward_fn = reward_fn
-        self.beta = beta
-
-        # ── replay buffer ───────────────────────────────────────────
-        self.replay_buffer = ReplayBuffer(max_size=replay_buffer_size)
-
-        # ── optimiser ───────────────────────────────────────────────
-        self.optimizer = Adam([
-            {"params": self.finetuned.backbone.parameters(), "lr": lr},
-            {"params": self.log_z_net.parameters(), "lr": lr_logz},
-        ])
-
-        # ── EMA for fine-tuned backbone ─────────────────────────────
-        self.ema_decay = ema_decay
-        self.ema_params = {
-            n: p.data.clone()
-            for n, p in self.finetuned.backbone.named_parameters()
-        }
-
-        # ── hparams ─────────────────────────────────────────────────
-        self.batch_size = batch_size
-        self.warmup_logz_steps = warmup_logz_steps
-        self.sampling_eps = sampling_eps
-        self.refill_interval = refill_interval
-        self.refill_batch_size = refill_batch_size
-        self.initial_buffer_from_pretrained = initial_buffer_from_pretrained
-        self.softmax_temp = softmax_temp
-        self.randomness = randomness
-        self.min_add_len = min_add_len
-        self.verbose = verbose
-        self.global_step = 0
-
-    # ── helpers ──────────────────────────────────────────────────────
-
-    def _compute_denoising_log_prob(self, model, x0, xt):
-        """log q(x₀ | xₜ) = Σ_{i : xₜⁱ = MASK} log softmax(logits)[i, x₀ⁱ].
-
-        Only masked positions contribute; unmasked positions are
-        deterministic (log-prob = 0).
+    def forward(self, xt: torch.Tensor, t: torch.Tensor, attn_mask: torch.Tensor = None) -> torch.Tensor:
         """
-        attention_mask = (xt != self.pad_idx).long()
-        logits = model(xt, attention_mask)                    # [B, L, V]
-        log_probs = F.log_softmax(logits, dim=-1)            # [B, L, V]
-        # gather the log-prob assigned to the true clean token at each pos
-        lp = log_probs.gather(2, x0.unsqueeze(-1)).squeeze(-1)  # [B, L]
-        mask = (xt == self.mask_idx).float()
-        return (lp * mask).sum(dim=1)                         # [B]
-
-    def _decode_tokens(self, x):
-        """Token tensor → list of SMILES (None for failures)."""
-        strs = self.tokenizer.batch_decode(x, skip_special_tokens=True)
-        out = []
-        for s in strs:
-            if not s:
-                out.append(None)
-                continue
-            if self.use_bracket_safe:
-                try:
-                    smi = safe_to_smiles(bracketsafe2safe(s), fix=True)
-                except Exception:
-                    smi = safe_to_smiles(s, fix=True)
-            else:
-                smi = safe_to_smiles(s, fix=True)
-            if smi:
-                smi = sorted(smi.split("."), key=len)[-1]
-            out.append(smi)
-        return out
-
-    @torch.no_grad()
-    def _generate_tokens(self, model, num_samples):
-        """Run the confidence-based denoising loop and return raw tokens.
+        Args:
+            xt:        [B, L] int token ids
+            t:         [B]    float diffusion times in [0, 1]
+            attn_mask: [B, L] float/long attention mask (1 = real token)
 
         Returns:
-            xt: [N, L] final (fully-denoised) token tensor
+            log_z: [B] scalar per example
         """
-        model.backbone.eval()
-        # build fully-masked input: [BOS] [MASK…] [EOS]
-        seqs = []
-        for _ in range(num_samples):
-            add_len = self.min_add_len
-            seq = torch.cat([
-                torch.tensor([self.bos_idx]),
-                torch.full((add_len,), self.mask_idx),
-                torch.tensor([self.eos_idx]),
-            ])
-            seqs.append(seq)
-        max_l = max(len(s) for s in seqs)
-        xt = torch.stack([
-            F.pad(s, (0, max_l - len(s)), value=self.pad_idx) for s in seqs
-        ]).to(self.device)
+        x = self.token_emb(xt.clamp(0, self.token_emb.num_embeddings - 1))  # [B, L, d]; clamp mask_idx OOB
+        t_emb = self.time_proj(t.unsqueeze(-1).float())     # [B, d]
+        x = x + t_emb.unsqueeze(1)                         # [B, L, d]
 
-        num_steps = max(int(self.mdlm.get_num_steps_confidence(xt)), 2)
-        att = (xt != self.pad_idx).long()
-        for i in range(num_steps):
-            logits = model(xt, att)
-            xt = self.mdlm.step_confidence(
-                logits, xt, i, num_steps,
-                self.softmax_temp, self.randomness,
-            )
-        model.backbone.train()
-        return xt
+        key_padding_mask = None
+        if attn_mask is not None:
+            key_padding_mask = ~attn_mask.bool()            # True = ignore
 
-    @torch.no_grad()
-    def _fill_buffer(self, model, num_samples, label=""):
-        """Generate molecules, evaluate reward, store valid ones."""
-        xt = self._generate_tokens(model, num_samples)
-        smiles = self._decode_tokens(xt)
-        rewards = self.reward_fn(smiles)          # [N]
-        att = (xt != self.pad_idx).long()
+        x = self.encoder(x, src_key_padding_mask=key_padding_mask)  # [B, L, d]
 
-        valid = torch.isfinite(rewards) & (rewards > 0)
-        n_valid = int(valid.sum())
-        if n_valid > 0:
-            self.replay_buffer.add_batch(
-                xt[valid], att[valid],
-                [s for s, v in zip(smiles, valid) if v],
-                rewards[valid],
-            )
-        if self.verbose or label:
-            logger.info(
-                "%s: %d/%d valid  (buffer=%d)",
-                label or "fill", n_valid, num_samples, len(self.replay_buffer),
-            )
-        return n_valid
-
-    # ── single training step ────────────────────────────────────────
-
-    def train_step(self):
-        """One gradient step of single-step DDPP-LB (Algorithm 1).
-
-        Returns:
-            dict of scalar metrics, or None if buffer is too small.
-        """
-        if len(self.replay_buffer) < self.batch_size:
-            return None
-
-        x0, att_mask, smiles, rewards = self.replay_buffer.sample(self.batch_size)
-        x0 = x0.to(self.device)
-        rewards = rewards.to(self.device)
-        B = x0.shape[0]
-
-        # 1. sample time  t ∼ U[ε, 1−ε]
-        eps = self.sampling_eps
-        t = torch.rand(B, device=self.device) * (1.0 - 2 * eps) + eps
-
-        # 2. forward (masking) process:  xₜ ∼ p_t(xₜ | x₀)
-        xt = self.mdlm.forward_process(x0, t)
-
-        # 3. log q_θ(x₀ | xₜ)  — fine-tuned model
-        log_q = self._compute_denoising_log_prob(self.finetuned, x0, xt)
-
-        # 4. log p_pre(x₀ | xₜ)  — frozen pre-trained model
-        with torch.no_grad():
-            log_p = self._compute_denoising_log_prob(self.pretrained, x0, xt)
-
-        # 5. (1/β) · log R(x₀)
-        log_r = torch.log(rewards.clamp(min=1e-10)) / self.beta
-
-        # 6. log Ẑ_πt(xₜ)  — learned lower-bound
-        pad_mask = (xt == self.pad_idx)  # True = ignore
-        log_z = self.log_z_net(xt, t, padding_mask=pad_mask)
-
-        # 7. DDPP-LB loss
-        residual = log_q - log_p - log_r + log_z
-        loss = (residual ** 2).mean()
-
-        # 8. backward + step
-        self.optimizer.zero_grad()
-        if self.global_step < self.warmup_logz_steps:
-            # warmup: freeze denoiser, only train log-Z head
-            for p in self.finetuned.backbone.parameters():
-                p.requires_grad_(False)
-            loss.backward()
-            for p in self.finetuned.backbone.parameters():
-                p.requires_grad_(True)
+        if attn_mask is not None:
+            mask_f = attn_mask.unsqueeze(-1).float()        # [B, L, 1]
+            pooled = (x * mask_f).sum(1) / mask_f.sum(1).clamp(min=1.0)
         else:
-            loss.backward()
-        self.optimizer.step()
+            pooled = x.mean(1)                              # [B, d]
 
-        # 9. EMA update
-        with torch.no_grad():
-            for n, p in self.finetuned.backbone.named_parameters():
-                self.ema_params[n].mul_(self.ema_decay).add_(
-                    p.data, alpha=1 - self.ema_decay
-                )
+        return self.out(pooled).squeeze(-1)                 # [B]
 
-        self.global_step += 1
 
-        # 10. periodic buffer refill (on-policy from fine-tuned model)
-        if (self.refill_interval > 0
-                and self.global_step % self.refill_interval == 0):
-            self._fill_buffer(
-                self.finetuned, self.refill_batch_size,
-                label=f"step-{self.global_step} on-policy refill",
-            )
+# ---------------------------------------------------------------------------
+# Replay buffer
+# ---------------------------------------------------------------------------
+
+class ReplayBuffer:
+    """
+    Fixed-capacity FIFO buffer.  Entries are stored as CPU tensors and padded
+    on the fly when a batch is sampled.
+    """
+
+    def __init__(self, capacity: int = 10_000, pad_token_id: int = 0, eviction: str = "fifo"):
+        self.capacity = capacity
+        # For FIFO we use deque (O(1) evict); for priority we use list + min-search on add
+        self.buf = deque(maxlen=capacity) if eviction == "fifo" else []
+        self.pad_token_id = pad_token_id
+        self.eviction = eviction
+
+    def add(
+        self,
+        input_ids: torch.Tensor,    # [1, L] or [L]
+        attention_mask: torch.Tensor,
+        smiles: str,
+        reward: float,
+    ) -> None:
+        ids = input_ids.squeeze(0).cpu()
+        mask = attention_mask.squeeze(0).cpu()
+        entry = {"input_ids": ids, "attention_mask": mask, "smiles": smiles, "reward": reward}
+        if self.eviction == "priority":
+            if len(self.buf) < self.capacity:
+                self.buf.append(entry)
+            else:
+                # Find min-reward entry; replace only if new reward is higher
+                min_i = 0
+                min_r = self.buf[0]["reward"]
+                for i in range(1, len(self.buf)):
+                    if self.buf[i]["reward"] < min_r:
+                        min_r = self.buf[i]["reward"]
+                        min_i = i
+                if reward > min_r:
+                    # remove min and append new to end (preserves "fresh at tail" semantics)
+                    self.buf.pop(min_i)
+                    self.buf.append(entry)
+                else:
+                    # New reward is lower than everything in buffer; still append to tail
+                    # but evict oldest (index 0) to keep capacity
+                    self.buf.pop(0)
+                    self.buf.append(entry)
+        else:
+            self.buf.append(entry)
+
+    def sample(self, batch_size: int, fresh_count: int = 0, fresh_fraction: float = 0.0) -> dict:
+        if fresh_count > 0 and fresh_fraction > 0.0 and fresh_count < len(self.buf):
+            n_fresh = min(int(round(batch_size * fresh_fraction)), fresh_count)
+            n_old = batch_size - n_fresh
+            buf_list = list(self.buf)
+            fresh_pool = buf_list[-fresh_count:]
+            old_pool = buf_list[:-fresh_count]
+            fresh_batch = random.sample(fresh_pool, min(n_fresh, len(fresh_pool)))
+            if len(fresh_batch) < n_fresh:
+                n_old += n_fresh - len(fresh_batch)
+            old_batch = random.sample(old_pool, min(n_old, len(old_pool))) if old_pool else []
+            batch = fresh_batch + old_batch
+        else:
+            batch = random.sample(self.buf, min(batch_size, len(self.buf)))
+        max_len = max(item["input_ids"].shape[0] for item in batch)
+
+        ids_list, mask_list, rewards = [], [], []
+        for item in batch:
+            ids = item["input_ids"]
+            L = ids.shape[0]
+            pad = max_len - L
+            ids_list.append(torch.cat([ids, torch.full((pad,), self.pad_token_id, dtype=ids.dtype)]))
+            mask_list.append(torch.cat([item["attention_mask"], torch.zeros(pad, dtype=torch.long)]))
+            rewards.append(item["reward"])
 
         return {
-            "loss": loss.item(),
-            "residual_abs": residual.abs().mean().item(),
-            "log_q": log_q.mean().item(),
-            "log_p": log_p.mean().item(),
-            "log_r": log_r.mean().item(),
-            "log_z": log_z.mean().item(),
+            "input_ids": torch.stack(ids_list),
+            "attention_mask": torch.stack(mask_list),
+            "rewards": torch.tensor(rewards, dtype=torch.float),
         }
 
-    # ── main training loop ──────────────────────────────────────────
+    def __len__(self) -> int:
+        return len(self.buf)
 
-    def train(self, num_steps: int, timeout_sec: float = None):
-        """Run the full DDPP-LB fine-tuning loop.
+
+# ---------------------------------------------------------------------------
+# DDPP-LB Trainer
+# ---------------------------------------------------------------------------
+
+class DDPPLBTrainer:
+    """
+    Fine-tunes a GenMol model using the DDPP-LB objective.
+
+    Args:
+        pretrained_model:           Loaded GenMol instance (will be frozen).
+                                    Mutually exclusive with model_path.
+        reward_fn:                  callable(list[str]) -> list[float | None]
+        beta:                       Inverse temperature scaling log R.
+        lr:                         Learning rate for the finetuned backbone θ.
+        lr_logz:                    Learning rate for the LogZNetwork φ.
+        buffer_size:                Maximum replay buffer capacity.
+        batch_size:                 Training batch size.
+        warmup_logz_steps:          Train only φ for this many steps before
+                                    unfreezing θ (stabilises log Z first).
+        refill_interval:            Auto-refill buffer every N steps (0 = disabled).
+        refill_num_samples:         Molecules to generate per auto-refill.
+        ema_decay:                  EMA decay for the finetuned backbone.
+        logz_d_model:               Hidden size of LogZNetwork.
+        logz_nhead:                 Attention heads of LogZNetwork.
+        logz_num_layers:            Transformer depth of LogZNetwork.
+        model_path:                 Path to GenMol checkpoint (alternative to pretrained_model).
+        replay_buffer_size:         Alias for buffer_size.
+        initial_buffer_from_pretrained: Generate this many molecules from the
+                                    pretrained model at init to seed the buffer.
+    """
+
+    def __init__(
+        self,
+        pretrained_model=None,
+        reward_fn=None,
+        beta: float = 1.0,
+        lr: float = 1e-5,
+        lr_logz: float = 1e-3,
+        buffer_size: int = 10_000,
+        batch_size: int = 32,
+        warmup_logz_steps: int = 100,
+        refill_interval: int = 50,
+        refill_num_samples: int = 16,
+        ema_decay: float = 0.999,
+        logz_d_model: int = 256,
+        logz_nhead: int = 4,
+        logz_num_layers: int = 2,
+        # comparison.py-compatible kwargs
+        model_path: str = None,
+        replay_buffer_size: int = None,
+        initial_buffer_from_pretrained: int = 0,
+    ):
+        # ---- resolve model -----------------------------------------------
+        try:
+            from genmol.sampler import load_model_from_path
+        except ModuleNotFoundError:
+            from genmol.samplers import load_model_from_path
+        if model_path is not None:
+            # Load twice to get independent backbone weights without deepcopy
+            # (deepcopy fails for models with custom Rust tokenizer PreTokenizers)
+            pretrained_model = load_model_from_path(model_path)
+            finetuned_model  = load_model_from_path(model_path)
+        elif pretrained_model is not None:
+            finetuned_model = copy.deepcopy(pretrained_model)
+        else:
+            raise ValueError("Provide either pretrained_model or model_path")
+
+        # replay_buffer_size is an alias for buffer_size
+        if replay_buffer_size is not None:
+            buffer_size = replay_buffer_size
+
+        self.model_path = model_path
+        self.reward_fn = reward_fn
+        self.beta = beta
+        self.batch_size = batch_size
+        self.warmup_logz_steps = warmup_logz_steps
+        self.refill_interval = refill_interval
+        self.refill_num_samples = refill_num_samples
+        self.step = 0
+        # Clipped-reward threshold (set by active loop each epoch).
+        # Rewards below this value are clipped to near-zero before computing
+        # log_r, focusing DDPP on molecules above the threshold.
+        # Units: same as the rewards stored in the buffer (shifted FA scores).
+        self.reward_clip_threshold: float = 0.0
+        self.fresh_fraction: float = 0.0
+        self.last_fresh_count: int = 0
+        # Floor for (reward - threshold).clamp(min=reward_floor). Default 1e-8 = log_r ~ -18 (strong push-down).
+        # Setting to 1.0 gives log_r=0 (neutral) for below-threshold samples (no aggressive suppression).
+        self.reward_floor: float = 1e-8
+        # Exploration bonus (A/B/C per De Santi 2025 / Sendera 2024 analysis)
+        self.exploration_approach: str = "none"   # none | A | B | C
+        self.exploration_gamma: float = 0.0        # γ coefficient (approach A & B); also μ in approach C
+        self.kl_lambda: float = 0.0                # λ (approach C only)
+        # Neg-score log-prob estimator (paired with exploration_approach A/B/C):
+        # "rough" = single-sample Σ 1[mask] log p (current, biased high-var);
+        # "llada" = LLaDA Alg-3 — n_mc fresh masks with L/l weight (unbiased).
+        self.negscore_estimator: str = "rough"
+        self.negscore_n_mc: int = 1
+        # MARA: Mode Anchored Reward Augmentation (GX-Chen 2025)
+        self.use_mara: bool = False
+
+        # ---- finetuned model (trainable copy) ----------------------------
+        self.finetuned = finetuned_model
+        self.finetuned.backbone.train()
+
+        # ---- pretrained model (frozen) -----------------------------------
+        self.pretrained = pretrained_model
+        self.pretrained.backbone.eval()
+        for p in self.pretrained.backbone.parameters():
+            p.requires_grad_(False)
+
+        # Shared references (same across both copies after deepcopy)
+        self.tokenizer = pretrained_model.tokenizer
+        self.mdlm = pretrained_model.mdlm
+        self.device = pretrained_model.device
+
+        # Keep mdlm on the right device
+        self.mdlm.to_device(self.device)
+
+        # ---- replay buffer -----------------------------------------------
+        self.buffer = ReplayBuffer(
+            capacity=buffer_size,
+            pad_token_id=self.tokenizer.pad_token_id,
+        )
+
+        # ---- LogZ network ------------------------------------------------
+        self.logz_net = LogZNetwork(
+            vocab_size=self.tokenizer.vocab_size,
+            d_model=logz_d_model,
+            nhead=logz_nhead,
+            num_layers=logz_num_layers,
+        ).to(self.device)
+
+        # ---- optimizers --------------------------------------------------
+        self.opt_theta = torch.optim.Adam(self.finetuned.backbone.parameters(), lr=lr)
+        self.opt_phi = torch.optim.Adam(self.logz_net.parameters(), lr=lr_logz)
+
+        # ---- EMA of finetuned backbone -----------------------------------
+        self.ema = ExponentialMovingAverage(
+            self.finetuned.backbone.parameters(), decay=ema_decay
+        )
+        self.ema.move_shadow_params_to_device(self.device)
+
+        # ---- optional initial buffer fill --------------------------------
+        if initial_buffer_from_pretrained > 0:
+            self._fill_buffer(self.pretrained, initial_buffer_from_pretrained)
+
+    # ------------------------------------------------------------------
+    # Properties
+    # ------------------------------------------------------------------
+
+    @property
+    def global_step(self) -> int:
+        """Alias for self.step — matches comparison.py API."""
+        return self.step
+
+    @property
+    def buffer_size(self) -> int:
+        return len(self.buffer)
+
+    # ------------------------------------------------------------------
+    # Core helpers
+    # ------------------------------------------------------------------
+
+    def _compute_denoising_log_prob(
+        self,
+        model,
+        x0: torch.Tensor,
+        xt: torch.Tensor,
+        attn_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Sum of log q(x0_i | xt) over positions i where xt_i == MASK.
 
         Args:
-            num_steps:   maximum gradient steps.
-            timeout_sec: wall-clock budget in seconds; stops early if exceeded.
-        """
-        import time as _time
-        t0 = _time.time()
-
-        # seed buffer from pre-trained model
-        n_init = max(self.initial_buffer_from_pretrained, self.batch_size * 2)
-        logger.info("Seeding replay buffer from pre-trained model (%d) …", n_init)
-        self._fill_buffer(self.pretrained, n_init, label="init-pretrained")
-
-        for step in range(1, num_steps + 1):
-            if timeout_sec is not None and (_time.time() - t0) >= timeout_sec:
-                logger.info("Training timeout at step %d (%.1fs)", step, timeout_sec)
-                break
-            metrics = self.train_step()
-            if metrics is None:
-                logger.warning("Buffer too small, skipping step %d", step)
-                self._fill_buffer(self.pretrained, self.batch_size * 2,
-                                  label="emergency-refill")
-                continue
-
-            if step % 100 == 0 or step == 1:
-                logger.info(
-                    "step %5d/%d  loss=%.4f  |res|=%.4f  log_z=%.2f",
-                    step, num_steps,
-                    metrics["loss"], metrics["residual_abs"], metrics["log_z"],
-                )
-
-    # ── generation with fine-tuned model ────────────────────────────
-
-    @torch.no_grad()
-    def generate(self, num_samples=100, use_ema=True):
-        """Sample molecules from the fine-tuned model.
+            model:     GenMol instance whose forward() is used.
+            x0:        [B, L] clean token ids.
+            xt:        [B, L] noisy (masked) token ids.
+            attn_mask: [B, L] attention mask.
 
         Returns:
-            list[str | None]  SMILES strings
+            [B] per-example summed log probabilities.
         """
-        if use_ema:
-            orig = {}
-            for n, p in self.finetuned.backbone.named_parameters():
-                orig[n] = p.data.clone()
-                p.data.copy_(self.ema_params[n])
+        logits = model.forward(xt, attn_mask)              # [B, L, V]
+        log_probs = F.log_softmax(logits, dim=-1)          # [B, L, V]
+        token_lp = log_probs.gather(-1, x0.clamp(0, logits.shape[-1] - 1).unsqueeze(-1)).squeeze(-1)  # [B, L]
+        # Only count positions that were masked in xt
+        masked = (xt == model.mask_index).float()          # [B, L]
+        return (token_lp * masked).sum(-1)                 # [B]
 
-        xt = self._generate_tokens(self.finetuned, num_samples)
-        smiles = self._decode_tokens(xt)
+    def _compute_denoising_log_prob_alg3(
+        self,
+        model,
+        x0: torch.Tensor,
+        attn_mask: torch.Tensor,
+        n_mc: int,
+    ) -> torch.Tensor:
+        """LLaDA Algorithm 3 marginal log-likelihood estimator.
 
-        if use_ema:
-            for n, p in self.finetuned.backbone.named_parameters():
-                p.data.copy_(orig[n])
-
-        return smiles
-
-    # ── save / load ─────────────────────────────────────────────────
-
-    def save(self, path):
-        """Save fine-tuned checkpoint (EMA weights)."""
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        # snapshot EMA weights
-        state = {k: v.clone() for k, v in self.ema_params.items()}
-        torch.save({
-            "backbone_state_dict": state,
-            "log_z_state_dict": self.log_z_net.state_dict(),
-            "optimizer_state_dict": self.optimizer.state_dict(),
-            "global_step": self.global_step,
-            "beta": self.beta,
-        }, path)
-        logger.info("Saved DDPP-LB checkpoint → %s", path)
-
-    def load(self, path):
-        """Resume from a DDPP-LB checkpoint."""
-        ckpt = torch.load(path, map_location=self.device, weights_only=False)
-        self.finetuned.backbone.load_state_dict(
-            ckpt["backbone_state_dict"], strict=False
-        )
-        self.ema_params = {
-            k: v.to(self.device) for k, v in ckpt["backbone_state_dict"].items()
-        }
-        self.log_z_net.load_state_dict(ckpt["log_z_state_dict"])
-        self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        self.global_step = ckpt.get("global_step", 0)
-        logger.info("Loaded DDPP-LB checkpoint ← %s  (step %d)", path, self.global_step)
-
-    # ── CLI entry point ──────────────────────────────────────────────
-
-    @staticmethod
-    def run_from_config(cfg):
-        """Full train → evaluate → save pipeline driven by a Hydra config.
-
-        Used by ``scripts/train_ddpp.py`` (thin CLI wrapper).
+        Resamples n_mc fresh masked xt's via mdlm.forward_process(t ~ U(0,1)),
+        applies the L/l importance weight per realization, averages. Unbiased
+        estimator of the MDM ELBO bound on log p_θ(x0).
         """
-        import json
-        import time as _time
+        B = x0.shape[0]
+        valid_L = attn_mask.sum(dim=1).clamp(min=1).float()       # [B]
+        accum = torch.zeros(B, device=x0.device)
+        for _ in range(int(n_mc)):
+            t = self.mdlm.sample_time(B)
+            xt = self.mdlm.forward_process(x0, t)
+            masked_count = ((xt == model.mask_index).float()
+                            * attn_mask.float()).sum(dim=1).clamp(min=1)
+            lp = self._compute_denoising_log_prob(model, x0, xt, attn_mask)
+            accum = accum + (valid_L / masked_count) * lp
+        return accum / float(n_mc)
 
-        import hydra
-        import pandas as pd
-        from omegaconf import OmegaConf
-        from rdkit import Chem
-        from rdkit.Chem import Descriptors, QED as _QED
+    # ------------------------------------------------------------------
+    # Training
+    # ------------------------------------------------------------------
 
-        from genmol.rewards import get_reward
+    def train_step(self) -> float | None:
+        """
+        Execute one DDPP-LB gradient step.
 
-        model_path = hydra.utils.to_absolute_path(cfg.model_path)
-        output_dir = hydra.utils.to_absolute_path(cfg.output_dir)
-        os.makedirs(output_dir, exist_ok=True)
+        Returns:
+            Loss value (float), or None if the buffer is too small.
+        """
+        if len(self.buffer) < self.batch_size:
+            return None
 
-        reward_name = cfg.get("reward", "qed")
-        reward_fn = get_reward(reward_name)
-        if reward_fn is None:
-            raise ValueError(f"Reward '{reward_name}' not found")
+        # On-policy auto-refill (skip step 0; refill_interval=0 disables)
+        if self.refill_interval > 0 and self.step > 0 and self.step % self.refill_interval == 0:
+            self._fill_buffer(self.finetuned, self.refill_num_samples)
 
-        trainer = DDPPLBTrainer(
-            model_path=model_path,
-            reward_fn=reward_fn,
-            lr=cfg.get("lr", 1e-4),
-            lr_logz=cfg.get("lr_logz", 1e-3),
-            batch_size=cfg.get("batch_size", 16),
-            beta=cfg.get("beta", 1.0),
-            replay_buffer_size=cfg.get("replay_buffer_size", 10_000),
-            warmup_logz_steps=cfg.get("warmup_logz_steps", 0),
-            sampling_eps=cfg.get("sampling_eps", 1e-3),
-            refill_interval=cfg.get("refill_interval", 250),
-            refill_batch_size=cfg.get("refill_batch_size", 16),
-            initial_buffer_from_pretrained=cfg.get("initial_buffer_from_pretrained", 64),
-            softmax_temp=cfg.get("softmax_temp", 0.8),
-            randomness=cfg.get("randomness", 0.5),
-            min_add_len=cfg.get("min_add_len", 60),
-            ema_decay=cfg.get("ema_decay", 0.9999),
-            seed=cfg.get("seed", 0),
-            verbose=cfg.get("verbose", False),
-        )
+        batch = self.buffer.sample(self.batch_size, fresh_count=self.last_fresh_count, fresh_fraction=self.fresh_fraction)
+        input_ids = batch["input_ids"].to(self.device)
+        attn_mask = batch["attention_mask"].to(self.device)
+        rewards = batch["rewards"].to(self.device)
 
-        num_steps = cfg.get("num_steps", 5000)
-        logger.info("Starting DDPP-LB training for %d steps …", num_steps)
-        logger.info("Config:\n%s", OmegaConf.to_yaml(cfg))
+        B = input_ids.shape[0]
+        t = self.mdlm.sample_time(B)
+        xt = self.mdlm.forward_process(input_ids, t)
 
-        t0 = _time.time()
-        trainer.train(num_steps)
-        elapsed = _time.time() - t0
+        # log q_θ(x0 | xt)  — finetuned model (differentiable)
+        log_q = self._compute_denoising_log_prob(self.finetuned, input_ids, xt, attn_mask)
 
-        ckpt_path = os.path.join(output_dir, "ddpp_checkpoint.pt")
-        trainer.save(ckpt_path)
+        # log p_pre(x0 | xt) — frozen pretrained (no grad)
+        with torch.no_grad():
+            log_p = self._compute_denoising_log_prob(self.pretrained, input_ids, xt, attn_mask)
 
-        # ── evaluate ─────────────────────────────────────────────────
-        num_eval = cfg.get("num_eval_samples", 100)
-        logger.info("Generating %d evaluation samples …", num_eval)
-        smiles = trainer.generate(num_eval, use_ema=True)
+        # MARA reward augmentation (GX-Chen 2025, Algorithm 1):
+        # For above-threshold samples, set R̄(y) = R(z) + β*(log p_pre(z) - log p_pre(y))
+        # where z is the most-prior-likely above-threshold sample in the batch.
+        # Makes the optimal target distribution uniform over above-threshold modes.
+        if self.use_mara:
+            above = rewards >= self.reward_clip_threshold
+            if above.sum() >= 1:
+                above_idx = above.nonzero(as_tuple=True)[0]
+                anchor_local = log_p[above_idx].argmax()
+                anchor_idx = above_idx[anchor_local]
+                r_anchor = rewards[anchor_idx].detach()
+                log_p_anchor = log_p[anchor_idx].detach()
+                rewards = rewards.clone()
+                rewards[above] = r_anchor + self.beta * (log_p_anchor - log_p[above].detach())
 
-        def _mw(s):
-            mol = Chem.MolFromSmiles(s) if s else None
-            return float(Descriptors.MolWt(mol)) if mol else None
+        # (1/β) · log R(x0) with optional exploration bonus (A/B/C)
+        clipped_rewards = (rewards - self.reward_clip_threshold).clamp(min=self.reward_floor)
+        log_r_cvar = torch.log(clipped_rewards) / self.beta
+        if self.exploration_approach in ("A", "B", "C") and self.exploration_gamma > 0:
+            # log p_k(x): current-model log-likelihood of x0|xt (detached — no grad).
+            # Estimator: "rough" = single-sample raw Σ 1[mask] log p (current, biased
+            # high-variance); "llada" = LLaDA Alg-3, average n_mc fresh mask
+            # realizations with L/l importance weight (unbiased lower-variance).
+            with torch.no_grad():
+                if self.negscore_estimator == "llada":
+                    log_p_k = self._compute_denoising_log_prob_alg3(
+                        self.finetuned, input_ids, attn_mask, self.negscore_n_mc,
+                    ).detach()
+                else:
+                    log_p_k = self._compute_denoising_log_prob(
+                        self.finetuned, input_ids, xt, attn_mask,
+                    ).detach()
+            if self.exploration_approach == "A":
+                # additive: log_r = log_r_cvar - γ * log_p_k
+                log_r = log_r_cvar - self.exploration_gamma * log_p_k
+            elif self.exploration_approach == "B":
+                # multiplicative reweight in tail: log_r = log_r_cvar + γ * log(-log p_k)
+                neg_log_p = (-log_p_k).clamp(min=1e-6)
+                log_r = log_r_cvar + self.exploration_gamma * torch.log(neg_log_p)
+            else:  # C: three-functional FDC in linear space + log at end
+                r_cvar_lin = clipped_rewards  # already clamped to reward_floor
+                C_const = 10.0  # stabilizing constant to keep argument positive
+                r_eff = (self.exploration_gamma * r_cvar_lin
+                         + (1.0 + self.kl_lambda) * (-log_p_k)
+                         + self.kl_lambda * log_p.detach()
+                         + C_const)
+                log_r = torch.log(r_eff.clamp(min=self.reward_floor)) / self.beta
+        else:
+            log_r = log_r_cvar
 
-        df = pd.DataFrame({"smiles": smiles, "mol_wt": [_mw(s) for s in smiles]})
-        df.to_csv(os.path.join(output_dir, "samples.csv"), index=False)
+        # log Ẑ_φ(xt, t)
+        log_z = self.logz_net(xt, t, attn_mask)
 
-        valid_mols = [m for m in (Chem.MolFromSmiles(s) for s in smiles if s) if m]
-        validity = len(valid_mols) / max(num_eval, 1)
-        unique = len(set(s for s in smiles if s)) / max(len(valid_mols), 1)
+        # DDPP-LB squared residual
+        residual = log_q - log_p - log_r + log_z          # [B]
+        loss = (residual ** 2).mean()
 
-        qeds = sorted([_QED.qed(m) for m in valid_mols], reverse=True)
-        qed_mean = sum(qeds) / len(qeds) if qeds else 0.0
-        top10_n = max(1, len(qeds) // 10)
-        qed_top10 = sum(qeds[:top10_n]) / top10_n if qeds else 0.0
+        # Gradient step on φ (always)
+        self.opt_phi.zero_grad()
+        # Gradient step on θ (after warmup)
+        if self.step >= self.warmup_logz_steps:
+            self.opt_theta.zero_grad()
 
-        reward_scores = reward_fn(smiles)
-        finite = reward_scores.isfinite()
-        reward_mean = reward_scores[finite].mean().item() if finite.any() else 0.0
+        loss.backward()
 
-        metrics = {
-            "elapsed_sec": elapsed, "num_steps": num_steps,
-            "beta": cfg.get("beta", 1.0), "reward": reward_name,
-            "reward_mean": reward_mean, "validity": validity,
-            "uniqueness": unique, "qed_mean": qed_mean,
-            "qed_top10": qed_top10, "qed_max": qeds[0] if qeds else 0.0,
-        }
-        with open(os.path.join(output_dir, "metrics.json"), "w") as f:
-            json.dump(metrics, f, indent=2)
-        with open(os.path.join(output_dir, "config.yaml"), "w") as f:
-            f.write(OmegaConf.to_yaml(cfg))
+        torch.nn.utils.clip_grad_norm_(self.logz_net.parameters(), 1.0)
+        self.opt_phi.step()
+        if self.step >= self.warmup_logz_steps:
+            torch.nn.utils.clip_grad_norm_(self.finetuned.backbone.parameters(), 1.0)
+            self.opt_theta.step()
+            self.ema.update(itertools.chain(self.finetuned.backbone.parameters()))
 
-        logger.info("Time: %.1f sec  Validity: %.4f  Reward: %.4f  QED: %.4f",
-                     elapsed, validity, reward_mean, qed_mean)
-        logger.info("Output: %s", output_dir)
+        self.step += 1
+        return loss.item()
+
+
+    # ── FinetuneTrainer interface ─────────────────────────────────────────
+
+    @property
+    def model(self):
+        """Return a GenerativeModel view of the fine-tuned backbone.
+
+        Cached so repeated calls in the active loop don't create new wrappers.
+        The wrapper holds a reference to self.finetuned, so it always reflects
+        the current (post-training) backbone weights.
+        """
+        if not hasattr(self, "_gen_model_cache"):
+            from genmol.genmol_model import GenMolGenerativeModel
+            max_len = getattr(
+                getattr(self.finetuned, "config", None), "model", {}
+            )
+            if hasattr(max_len, "max_position_embeddings"):
+                max_len = max_len.max_position_embeddings
+            else:
+                max_len = 128
+            object.__setattr__(
+                self, "_gen_model_cache",
+                GenMolGenerativeModel(self.finetuned, self.tokenizer, str(self.device), max_len)
+            )
+        return self._gen_model_cache
+
+    @property
+    def step(self):
+        return getattr(self, "_step", 0)
+
+    def train(self, max_steps: int, timeout_sec: float = None) -> None:
+        """
+        Run training loop for up to max_steps steps or timeout_sec seconds.
+
+        Matches comparison.py's: trainer.train(max_steps, timeout_sec=budget)
+
+        Bootstrap: if the buffer is too small to start training and auto-refill
+        is enabled, do one immediate fill from the finetuned model before the
+        loop.  This handles the run_ddpp_method pattern where no external data
+        is added before train() is called.  run_mcts_surrogate_method avoids
+        this by passing refill_interval=0 and filling the buffer manually.
+        """
+        if len(self.buffer) < self.batch_size and self.refill_interval > 0:
+            n = max(self.refill_num_samples, self.batch_size * 4)
+            for _ in range(10):  # retry until buffer is large enough
+                self._fill_buffer(self.finetuned, n)
+                if len(self.buffer) >= self.batch_size:
+                    break
+
+        t0 = time()
+        for _ in range(max_steps):
+            if timeout_sec is not None and (time() - t0) >= timeout_sec:
+                break
+            self.train_step()
+
+    # ------------------------------------------------------------------
+    # Generation
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def _generate(
+        self,
+        model,
+        num_samples: int,
+        use_ema: bool = True,
+        softmax_temp: float = 0.8,
+        randomness: float = 0.5,
+        min_add_len: int = 40,
+    ) -> list[str | None]:
+        """
+        Generate molecules from `model` using the confidence-based MDLM denoising loop.
+        Returns a list of SMILES (or None for invalid).
+        """
+        pad_index = self.tokenizer.pad_token_id
+        mask_index = model.mask_index
+        bos_index = model.bos_index
+        eos_index = model.eos_index
+
+        ema_active = (use_ema and model is self.finetuned
+                      and self.step > self.warmup_logz_steps)
+        if ema_active:
+            self.ema.store(itertools.chain(model.backbone.parameters()))
+            self.ema.copy_to(itertools.chain(model.backbone.parameters()))
+
+        try:
+            seqs = []
+            for _ in range(num_samples):
+                seq = torch.cat([
+                    torch.tensor([bos_index], device=self.device),
+                    torch.full((min_add_len,), mask_index, device=self.device),
+                    torch.tensor([eos_index], device=self.device),
+                ], dim=0)
+                seqs.append(seq)
+
+            x = torch.stack(seqs)                          # [N, L]
+            attention_mask = (x != pad_index).long()
+
+            num_steps = max(self.mdlm.get_num_steps_confidence(x), 2)
+            for i in range(num_steps):
+                logits = model(x, attention_mask)
+                x = self.mdlm.step_confidence(logits, x, i, num_steps, softmax_temp, randomness)
+
+            decoded = self.tokenizer.batch_decode(x, skip_special_tokens=True)
+            from genmol.utils.utils_chem import safe_to_smiles
+            try:
+                from genmol.utils.bracket_safe_converter import bracketsafe2safe
+                _convert = bracketsafe2safe
+            except ImportError:
+                _convert = lambda s: s  # noqa: E731  # local model, no bracket tokens
+            smiles_list = []
+            for s in decoded:
+                smi = safe_to_smiles(_convert(s), fix=True)
+                if smi:
+                    smi = sorted(smi.split("."), key=len)[-1]
+                else:
+                    smi = None
+                smiles_list.append(smi)
+            return smiles_list
+
+        finally:
+            if ema_active:
+                self.ema.restore(itertools.chain(model.backbone.parameters()))
+
+    # ------------------------------------------------------------------
+    # Buffer population
+    # ------------------------------------------------------------------
+
+    def _fill_buffer(self, model_or_num, num_samples=None, label=None) -> None:
+        """
+        Generate molecules and insert scored ones into the buffer.
+
+        Two calling conventions (both supported):
+            _fill_buffer(num_samples)                           — generates from finetuned
+            _fill_buffer(model, num_samples, label=...)         — comparison.py style
+        """
+        if num_samples is None:
+            # Called as _fill_buffer(num_samples)
+            model, n = self.finetuned, model_or_num
+        else:
+            # Called as _fill_buffer(model, num_samples, label=...)
+            model, n = model_or_num, num_samples
+
+        smiles_list = self._generate(model, n)
+        valid = [s for s in smiles_list if s is not None]
+        if not valid:
+            return
+        rewards = self.reward_fn(valid)
+        self.add_scored_molecules(valid, rewards)
+
+    def add_scored_molecules(self, smiles_list: list[str], rewards: list[float | None]) -> None:
+        """
+        Tokenise and insert pre-scored molecules directly into the replay buffer.
+
+        This is the entry point for offline data (e.g. oracle-scored candidates
+        from an outer MCTS/beam-search loop).
+        """
+        # track fresh additions for stratified sampling
+        _n_before = len(self.buffer.buf)
+        max_len = self.finetuned.config.model.max_position_embeddings
+        vocab_size = getattr(self.finetuned.config.model, "vocab_size", None) or self.tokenizer.vocab_size
+        for smi, r in zip(smiles_list, rewards):
+            if smi is None or r is None:
+                continue
+            try:
+                enc = self.tokenizer(
+                    [smi],
+                    return_tensors="pt",
+                    truncation=True,
+                    max_length=max_len,
+                )
+                ids = enc["input_ids"]
+                # sanity: token ids must be in valid embedding range
+                if ids.numel() == 0 or ids.max().item() >= vocab_size or ids.min().item() < 0:
+                    raise ValueError("out-of-vocab token id from tokenizer (smi=" + repr(smi)[:80] + ")")
+                self.buffer.add(enc["input_ids"], enc["attention_mask"], smi, float(r))
+            except Exception as e:
+                # Fallback: store penalty against a safe placeholder ([BOS][MASK][EOS]).
+                # Preserves the negative-reward signal without crashing the embedding lookup.
+                import torch as _torch
+                bos = getattr(self.finetuned, "bos_index", 1)
+                eos = getattr(self.finetuned, "eos_index", 2)
+                mask = getattr(self.finetuned, "mask_index", 0)
+                ids = _torch.tensor([[bos, mask, eos]], dtype=_torch.long)
+                attn = _torch.ones_like(ids)
+                self.buffer.add(ids, attn, "<INVALID>", float(r))
+
+    # ------------------------------------------------------------------
+    # Public generation API
+    # ------------------------------------------------------------------
+        self.last_fresh_count = max(0, len(self.buffer.buf) - _n_before)
+
+    def generate(self, num_samples: int, **kwargs) -> list[str]:
+        """Generate from the finetuned model, return valid SMILES only.
+
+        Side effects: stash raw output (with None for invalids) in
+        self._last_raw_smiles for downstream diversity logging.
+        """
+        raw = self._generate(self.finetuned, num_samples, **kwargs)
+        self._last_n_attempted = len(raw)
+        self._last_n_valid = sum(1 for s in raw if s is not None)
+        self._last_raw_smiles = list(raw)
+        return [s for s in raw if s is not None]

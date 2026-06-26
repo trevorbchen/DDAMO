@@ -1,6 +1,7 @@
 import math
 import os
 import warnings
+from time import time
 import torch
 from rdkit import Chem
 from rdkit.Chem import QED, DataStructs
@@ -148,7 +149,7 @@ class BeamSearchSampler(Sampler):
 
     def __init__(
         self,
-        path,
+        path=None,
         beam_width: int = 8,
         branching_factor: int = 4,
         steps_per_interval: int = None,  # None → total_steps // 4 (≈4 updates, matching Complexa)
@@ -156,9 +157,14 @@ class BeamSearchSampler(Sampler):
         elite_buffer_size: int = None,
         diversity_cutoff: float = None,
         diversity_penalty: float = 0.0,
+        soft_resample: bool = False,
+        soft_beta: float = 10.0,
+        scoring_mode: str = "completion",
+        model=None,
         **kwargs,
     ):
-        super().__init__(path, **kwargs)
+        super().__init__(path=path, model=model, **kwargs)
+        self.scoring_mode = scoring_mode
         self.beam_width = beam_width                  # N
         self.branching_factor = branching_factor      # L
         self.steps_per_interval = steps_per_interval  # K
@@ -167,6 +173,9 @@ class BeamSearchSampler(Sampler):
         self.elite_buffer_size = elite_buffer_size
         self.diversity_cutoff = diversity_cutoff
         self.diversity_penalty = diversity_penalty    # λ for Tanimoto penalty
+        # Complexa-style FKS: soft resample instead of hard top-N
+        self.soft_resample = soft_resample
+        self.soft_beta = soft_beta
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -204,9 +213,12 @@ class BeamSearchSampler(Sampler):
         Rollout all candidates to completion, decode, and score with forward_op.
         Returns (scores tensor [N], smiles list [N], forward_pass_count).
         """
-        rolled, fp = self._rollout(
-            candidates.clone(), current_step, total_steps, softmax_temp, randomness
-        )
+        if self.scoring_mode == "tweedie":
+            rolled, fp = self._tweedie_x0(candidates.clone())
+        else:
+            rolled, fp = self._rollout(
+                candidates.clone(), current_step, total_steps, softmax_temp, randomness
+            )
         smiles = self._decode_smiles(rolled)
         scores = self.forward_op(smiles).to(candidates.device)
         return scores, smiles, fp
@@ -254,7 +266,7 @@ class BeamSearchSampler(Sampler):
     # ------------------------------------------------------------------
 
     def _run_single_beam(self, N, L, K, total_steps, softmax_temp, randomness,
-                         min_add_len, elite):
+                         min_add_len, elite, max_reward_evals=None, _cumul_evals=0):
         """Run one beam search of width N. Returns (smiles_list, reward_evals, fp_count)."""
         # Start from a fully masked prototype: [BOS] [MASK...] [EOS]
         x_proto = torch.hstack([
@@ -271,6 +283,9 @@ class BeamSearchSampler(Sampler):
         last_logged_fp = 0
         last_logged_re = 0
         while step < total_steps:
+            # Check oracle budget (cumulative across all runs + this run)
+            if max_reward_evals is not None and (_cumul_evals + reward_evals) >= max_reward_evals:
+                break
             k = min(K, total_steps - step)
 
             # --- Branch: expand each beam into L children via K denoising steps ---
@@ -296,32 +311,54 @@ class BeamSearchSampler(Sampler):
                 scores = self.forward_op(rollout_smiles).to(candidates.device)
             reward_evals += len(candidates)
 
-            # Trajectory logging
-            self._log_point(
-                reward_evals - last_logged_re,
-                fp_count - last_logged_fp,
-                scores.max().item(),
-            )
-            last_logged_re = reward_evals
-            last_logged_fp = fp_count
+            # --- Select: keep N candidates from N*L ---
+            n_total = candidates.shape[0]
+            n_keep = min(N, n_total)
+            if self.soft_resample:
+                # Complexa-style FKS: resample proportional to exp(β·R)
+                log_w = self.soft_beta * scores
+                log_w = log_w - log_w.max()  # numerical stability
+                w = torch.exp(log_w)
+                w = w / w.sum()
+                idx = torch.multinomial(w, n_keep, replacement=True)
+                beam = candidates[idx]
+            else:
+                # Standard beam search: hard top-N
+                pruning_scores = self._diversity_penalized_scores(scores, rollout_smiles)
+                top_idx = pruning_scores.topk(n_keep).indices
+                beam = candidates[top_idx]
 
-            # Elite buffer sees raw (unpenalized) scores — it's a global best-of
-            # across all iterations, independent of the diversity pressure applied
-            # during pruning.
+            # Elite buffer sees raw (unpenalized) scores
             if elite is not None:
                 for smi, r in zip(rollout_smiles, scores.tolist()):
                     elite.update(smi, r)
 
-            # --- Prune: keep top-N candidates (with optional diversity penalty) ---
-            pruning_scores = self._diversity_penalized_scores(scores, rollout_smiles)
-            n_keep = min(N, candidates.shape[0])
-            top_idx = pruning_scores.topk(n_keep).indices
-            beam = candidates[top_idx]
+            # Trajectory logging with beam-specific fields
+            self._log_point(
+                reward_evals - last_logged_re,
+                fp_count - last_logged_fp,
+                scores.max().item(),
+                smiles_batch=rollout_smiles,
+                scores_batch=scores.tolist(),
+                candidates_kept=n_keep,
+                candidates_pruned=n_total - n_keep,
+            )
+            last_logged_re = reward_evals
+            last_logged_fp = fp_count
 
         # Merge elite buffer (best unique molecules across all rollouts) with
         # the final beam. Elite-first ordering means high-reward molecules from
         # earlier rollouts aren't lost to late-stage beam collapse.
         beam_smiles = [s for s in self._decode_smiles(beam) if s]
+        # Build score map: last-round scores for beam survivors + elite scores
+        score_map = {}
+        for smi, sc in zip(rollout_smiles, scores.tolist()):
+            if smi:
+                score_map[smi] = sc
+        if elite is not None:
+            for smi, sc in elite.buffer:
+                score_map[smi] = sc
+
         if elite is not None:
             seen = set()
             result = []
@@ -332,7 +369,8 @@ class BeamSearchSampler(Sampler):
         else:
             result = beam_smiles
 
-        return result, reward_evals, fp_count
+        result_scores = [score_map.get(s, float("nan")) for s in result]
+        return result, result_scores, reward_evals, fp_count
 
     @torch.no_grad()
     def de_novo_generation(
@@ -341,6 +379,8 @@ class BeamSearchSampler(Sampler):
         softmax_temp: float = 0.8,
         randomness: float = 0.5,
         min_add_len: int = 40,
+        timeout_sec: float = None,
+        max_reward_evals: int = None,
         beam_width: int = None,
         branching_factor: int = None,
         steps_per_interval: int = None,
@@ -373,14 +413,20 @@ class BeamSearchSampler(Sampler):
         all_smiles = []
         total_reward_evals = 0
         total_fp = 0
+        t0 = time()
 
         for _ in range(n_runs):
+            if timeout_sec is not None and time() - t0 > timeout_sec:
+                break
+            if max_reward_evals is not None and total_reward_evals >= max_reward_evals:
+                break
             elite = (
                 EliteBuffer(self.elite_buffer_size, self.diversity_cutoff)
                 if self.elite_buffer_size else None
             )
-            run_smiles, re, fp = self._run_single_beam(
-                N, L, K, total_steps, softmax_temp, randomness, min_add_len, elite
+            run_smiles, run_scores, re, fp = self._run_single_beam(
+                N, L, K, total_steps, softmax_temp, randomness, min_add_len, elite,
+                max_reward_evals=max_reward_evals, _cumul_evals=total_reward_evals,
             )
             all_smiles.extend(run_smiles)
             total_reward_evals += re

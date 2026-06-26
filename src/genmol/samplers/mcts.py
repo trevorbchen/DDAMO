@@ -1,6 +1,7 @@
 import math
 import os
 import warnings
+from time import time
 import torch
 
 from .base import Sampler, decode_smiles
@@ -71,20 +72,23 @@ class MCTSSampler(Sampler):
 
     def __init__(
         self,
-        path,
+        path=None,
         branching_factor: int = 4,
         steps_per_interval: int = 5,
         c_uct: float = 1.0,
         rollout_budget_per_sample: int = None,
         forward_op=None,
+        scoring_mode: str = "completion",
+        model=None,
         **kwargs,
     ):
-        super().__init__(path, **kwargs)
+        super().__init__(path=path, model=model, **kwargs)
         self.branching_factor = branching_factor
         self.steps_per_interval = steps_per_interval
         self.c_uct = c_uct
         self.rollout_budget_per_sample = rollout_budget_per_sample  # explicit budget cap
         self.forward_op = forward_op or QEDForwardOp()
+        self.scoring_mode = scoring_mode
 
     def _decode_smiles(self, x, fix=True):
         return decode_smiles(self.model, x, fix=fix)
@@ -164,8 +168,11 @@ class MCTSSampler(Sampler):
             child = MCTSNode(xi[i : i + 1].clone(), new_step, parent=node)
             node.children.append(child)
 
-        # --- Simulate: rollout all L children to completion in one GPU batch ---
-        if new_step < total_steps:
+        # --- Simulate: rollout children to scorable state (completion or Tweedie) ---
+        if self.scoring_mode == "tweedie" and new_step < total_steps:
+            rolled, rollout_fp = self._tweedie_x0(xi)
+            fp += rollout_fp
+        elif new_step < total_steps:
             rolled, rollout_fp = self._rollout(xi, new_step, total_steps, softmax_temp, randomness)
             fp += rollout_fp
         else:
@@ -195,18 +202,22 @@ class MCTSSampler(Sampler):
         """
         Handle a terminal node (step >= total_steps) during selection.
         Since decode is deterministic, re-rolling produces the same result.
-        Instead, just backprop the cached reward to boost this path's visit count.
+        Cache the reward on first visit to avoid redundant forward_op calls.
         Returns list of (reward, smiles) — empty if node has no valid molecule.
         """
-        smi = self._decode_smiles(node.x)
-        r = self.forward_op(smi).tolist()[0]
+        if not hasattr(node, '_cached_reward'):
+            smi = self._decode_smiles(node.x)
+            r = self.forward_op(smi).tolist()[0]
+            node._cached_reward = r
+            node._cached_smi = smi[0]
+        r = node._cached_reward
         # Backprop
         anc = node
         while anc is not None:
             anc.V += 1
             anc.total_R += r
             anc = anc.parent
-        return [(r, smi[0])] if smi[0] else []
+        return [(r, node._cached_smi)] if node._cached_smi else []
 
     # ------------------------------------------------------------------
     # Generation entry point
@@ -219,6 +230,8 @@ class MCTSSampler(Sampler):
         softmax_temp: float = 0.8,
         randomness: float = 0.5,
         min_add_len: int = 40,
+        timeout_sec: float = None,
+        max_reward_evals: int = None,
         **kwargs,
     ):
         L = self.branching_factor
@@ -235,10 +248,14 @@ class MCTSSampler(Sampler):
 
         # Budget: how many MCTS iterations to run.
         # Each iteration expands one node into L children, so total rollouts ≈ iters * L.
-        # Default formula (L * T / K) matches beam search's total candidate count
-        # for a fair comparison at the same compute budget.
-        if self.rollout_budget_per_sample is not None:
+        # When timeout_sec or max_reward_evals is set, use a large iter cap.
+        # Otherwise use a formula that matches beam search's total candidate count.
+        if max_reward_evals is not None:
+            num_rollouts = max_reward_evals
+        elif self.rollout_budget_per_sample is not None:
             num_rollouts = self.rollout_budget_per_sample * num_samples
+        elif timeout_sec is not None:
+            num_rollouts = 10_000_000  # effectively infinite; timeout will stop us
         else:
             num_rollouts = num_samples * round(L * total_steps / K)
         iters = max(1, num_rollouts // L)
@@ -252,26 +269,40 @@ class MCTSSampler(Sampler):
         # ── MCTS loop ─────────────────────────────────────────────────────
         all_results = []  # list of (reward, smiles)
         total_fp = 0
+        cum_simulations = 0
+        cum_rollouts = 0
+        t0 = time()
 
         for _ in range(iters):
+            if timeout_sec is not None and time() - t0 > timeout_sec:
+                break
+            if max_reward_evals is not None and cum_rollouts >= max_reward_evals:
+                break
+            cum_simulations += 1
             node = self._select(root, total_steps)
 
             if node.step >= total_steps:
-                # Terminal leaf — decode is deterministic, so just backprop
-                # the same reward to update visit counts (no new forward passes).
+                is_new = not hasattr(node, '_cached_reward')
                 terminal_results = self._handle_terminal(node)
-                all_results.extend(terminal_results)
-                best_t = max((r for r, _ in terminal_results), default=float("-inf"))
-                self._log_point(1, 0, best_t)
+                if is_new:
+                    all_results.extend(terminal_results)
+                    best_t = max((r for r, _ in terminal_results), default=float("-inf"))
+                    t_smiles = [smi for _, smi in terminal_results]
+                    t_scores = [r for r, _ in terminal_results]
+                    self._log_point(1, 0, best_t, smiles_batch=t_smiles, scores_batch=t_scores,
+                                    cum_simulations=cum_simulations, cum_rollouts=cum_rollouts)
             else:
-                # Unexpanded node — expand, simulate, backprop
                 results, fp = self._expand_simulate_backprop(
                     node, total_steps, softmax_temp, randomness
                 )
                 all_results.extend(results)
                 total_fp += fp
+                cum_rollouts += L
                 best_r = max((r for r, _ in results), default=float("-inf"))
-                self._log_point(L, fp, best_r)
+                r_smiles = [smi for _, smi in results]
+                r_scores = [r for r, _ in results]
+                self._log_point(L, fp, best_r, smiles_batch=r_smiles, scores_batch=r_scores,
+                                cum_simulations=cum_simulations, cum_rollouts=cum_rollouts)
 
         # ── Collect top-N unique SMILES ───────────────────────────────────
         # Unlike beam search which keeps a fixed-width beam, MCTS accumulates
@@ -288,13 +319,15 @@ class MCTSSampler(Sampler):
 
         # If the tree didn't produce enough unique molecules (can happen with
         # low budget or high beam collapse), fall back to unconditional sampling.
-        if len(final_smiles) < num_samples:
+        # Skip fallback when running under a time budget — MCTS already used
+        # the full budget on tree search; unconditional fill would be wasted time.
+        if len(final_smiles) < num_samples and timeout_sec is None and max_reward_evals is None:
             extra = super().de_novo_generation(
                 num_samples - len(final_smiles), softmax_temp, randomness, min_add_len
             )
             final_smiles += [s for s in extra if s]
 
-        self.last_reward_evals = num_rollouts
+        self.last_reward_evals = len(all_results)  # actual FA calls (one per rollout result)
         self.last_budget_per_sample = num_rollouts / max(num_samples, 1)
         self.last_forward_passes = total_fp
         self.last_fp_per_sample = total_fp / max(num_samples, 1)

@@ -28,9 +28,15 @@ from rdkit.Chem import AllChem, Descriptors
 
 warnings.filterwarnings("ignore")
 
-# Add FlashAffinity to path
-FLASH_ROOT = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))), "FlashAffinity")
-if FLASH_ROOT not in sys.path:
+# Add FlashAffinity to path.
+# Resolution order:
+#   1. FLASHAFFINITY_ROOT environment variable  (set this to use your own install)
+#   2. <genmol_repo_root>/FlashAffinity         (default bundled subdir)
+FLASH_ROOT = os.environ.get(
+    "FLASHAFFINITY_ROOT",
+    os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))), "FlashAffinity"),
+)
+if os.path.join(FLASH_ROOT, "src") not in sys.path:
     sys.path.insert(0, os.path.join(FLASH_ROOT, "src"))
 
 
@@ -84,22 +90,29 @@ def extract_ligand_repr(mol):
 
 
 def smiles_to_3d_mol(smiles: str):
-    """SMILES → RDKit mol with 3D coords. Returns None on failure."""
-    mol = Chem.MolFromSmiles(smiles)
-    if mol is None:
-        return None
-    mol = Chem.AddHs(mol)
-    status = AllChem.EmbedMolecule(mol, AllChem.ETKDGv3())
-    if status != 0:
-        status = AllChem.EmbedMolecule(mol, AllChem.ETKDGv3())
-    if status != 0:
-        return None
+    """SMILES → RDKit mol with 3D coords. Returns None on failure.
+    Catches all RDKit exceptions (AtomValenceException, AtomKekulizeException,
+    KekulizeException, etc.) that can arise for structurally-invalid but
+    grammar-valid SMILES from aggressive fine-tuning."""
     try:
-        AllChem.MMFFOptimizeMolecule(mol, maxIters=200)
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            return None
+        mol = Chem.AddHs(mol)
+        status = AllChem.EmbedMolecule(mol, AllChem.ETKDGv3())
+        if status != 0:
+            status = AllChem.EmbedMolecule(mol, AllChem.ETKDGv3())
+        if status != 0:
+            return None
+        try:
+            AllChem.MMFFOptimizeMolecule(mol, maxIters=200)
+        except Exception:
+            pass
+        mol = Chem.RemoveHs(mol)
+        return mol
     except Exception:
-        pass
-    mol = Chem.RemoveHs(mol)
-    return mol
+        # RDKit valence / kekulize / sanitization failures
+        return None
 
 
 class FlashAffinityForwardOp:
@@ -120,9 +133,12 @@ class FlashAffinityForwardOp:
         self.protein_id = protein_id
         self.distance_threshold = distance_threshold
 
-        # Default paths relative to genmol root
-        genmol_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
-        fa_root = os.path.join(genmol_root, "FlashAffinity")
+        # Default paths.  Override with FLASHAFFINITY_ROOT env var or pass
+        # explicit constructor arguments.
+        fa_root = os.environ.get(
+            "FLASHAFFINITY_ROOT",
+            os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))), "FlashAffinity"),
+        )
 
         if protein_pdb is None:
             protein_pdb = os.path.join(fa_root, "data/protein_test/pdb", f"{protein_id}.pdb")

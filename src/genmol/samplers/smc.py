@@ -12,6 +12,7 @@ import math
 import os
 import random
 import warnings
+from time import time
 
 import torch
 import torch.nn.functional as F
@@ -63,42 +64,74 @@ def multinomial_resample(log_weights):
 class DFKCSampler(Sampler):
     """Discrete Feynman-Kac Corrector for MDLM (Hasan et al., arXiv 2601.10403).
 
-    Implements Algorithm 1 with two modes:
+    Modes:
       annealing - sample from p_t^β via scaled logits (Eq 15) with
                   Feynman-Kac weight correction (Corollary 3.2, Eq 14).
                   No reward function needed.
       reward    - tilt distribution toward high reward via Δβ_t·r(x)
-                  weight increments (approximation of Corollary 3.6, Eq 20;
-                  exact per-token formulation is O(V·d) per step).
-                  Requires forward_op.
+                  weight increments. Oracle calls gated by score_start
+                  and score_interval to avoid wasting budget on early
+                  garbage SMILES. Uses accumulated d_beta (telescoping).
     """
 
     def __init__(
         self,
-        path,
+        path=None,
         forward_op=None,
         num_particles=8,
         mode="reward",
         beta=2.0,
         beta_schedule="linear",
+        score_start=0.5,
+        score_interval=5,
         ess_threshold=0.5,
         resample_strategy="systematic",
+        rollout=True,
+        scoring_mode=None,
+        fresh_weight=False,
+        score_interval_late=None,
+        late_phase=0.8,
+        elite_ratio=0.0,
+        elite_buffer_size=50,
+        elite_mask_ratio=0.5,
         seed=None,
         verbose=False,
+        model=None,
         **kwargs,
     ):
-        super().__init__(path, forward_op=forward_op, **kwargs)
+        super().__init__(path=path, forward_op=forward_op, model=model, **kwargs)
         self.forward_op = forward_op
         self.num_particles = max(int(num_particles), 2)
         self.mode = mode
         self.beta = float(beta)
         self.beta_schedule = beta_schedule
+        self.score_start = float(score_start)
+        self.score_interval = max(int(score_interval), 1)
+        self.score_interval_late = int(score_interval_late) if score_interval_late is not None else None
+        self.late_phase = float(late_phase)
+        self.rollout = bool(rollout)
+        # scoring_mode overrides rollout: "completion" (default), "tweedie", "current"
+        if scoring_mode is None:
+            scoring_mode = "completion" if self.rollout else "current"
+        self.scoring_mode = scoring_mode
+        self.fresh_weight = bool(fresh_weight)
+        self.elite_ratio = float(elite_ratio)
+        self.elite_buffer_size = int(elite_buffer_size)
+        self.elite_mask_ratio = float(elite_mask_ratio)
         self.ess_threshold = float(ess_threshold)
         self.resample_strategy = resample_strategy
         self.verbose = bool(verbose)
         if seed is not None:
             random.seed(seed)
             torch.manual_seed(seed)
+
+        if self.mode == "reward" and self.beta_schedule == "constant":
+            warnings.warn(
+                "DFKCSampler: mode='reward' with beta_schedule='constant' gives "
+                "d_beta=0 at every step, making reward weights uniform. "
+                "Use 'linear', 'quadratic', or 'cosine' instead.",
+                stacklevel=2,
+            )
 
     # ── Helpers ────────────────────────────────────────────────────
 
@@ -109,6 +142,13 @@ class DFKCSampler(Sampler):
             return self.beta
         elif self.beta_schedule == "cosine":
             return 1.0 + (self.beta - 1.0) * 0.5 * (1 - math.cos(math.pi * frac))
+        elif self.beta_schedule == "quadratic":
+            # Accelerating: small d_beta early, large d_beta late.
+            return 1.0 + (self.beta - 1.0) * frac * frac
+        elif self.beta_schedule == "sqrt":
+            # Decelerating: large d_beta early, small d_beta late.
+            # Front-loads selection pressure, leaves late steps for refinement.
+            return 1.0 + (self.beta - 1.0) * math.sqrt(frac)
         else:  # linear
             return 1.0 + (self.beta - 1.0) * frac
 
@@ -159,31 +199,127 @@ class DFKCSampler(Sampler):
         g = rate * per_pos * dt
         return g
 
-    def _reward_weight_increment(self, x, step, num_steps, beta_t):
+    def _rollout(self, x, start_step, num_steps, softmax_temp, randomness):
+        """Complete denoising from start_step to end. Returns (rolled_x, fp_count)."""
+        rolled = x.clone()
+        fp = 0
+        for j in range(start_step + 1, num_steps):
+            attention_mask = (rolled != self.pad_index)
+            logits = self.model(rolled, attention_mask)
+            fp += rolled.shape[0]
+            rolled = self.mdlm.step_confidence(
+                logits, rolled, j, num_steps, softmax_temp, randomness)
+        return rolled, fp
+
+    def _reward_weight_increment(self, x, step, num_steps, beta_t,
+                                 last_scored_step=None,
+                                 softmax_temp=0.8, randomness=0.5):
         """Compute log-weight increment for reward-tilted mode.
 
-        Approximation: decode particles, score with forward_op, scale
-        by delta_beta_t. The exact per-token approach is O(V*d) reward
-        evals per step -- impractical for molecules.
+        Rolls out particles to completion before scoring so that the
+        reward function always sees fully-denoised, valid SMILES.
+        Uses accumulated d_beta (telescoping property).
+
+        Returns (log_weight_increment, n_evals, best_reward, smiles,
+                 rewards_list, rollout_fp).
         """
         if self.forward_op is None:
-            return torch.zeros(x.shape[0], device=x.device), 0, float("-inf")
+            return torch.zeros(x.shape[0], device=x.device), 0, float("-inf"), [], [], 0
 
-        smiles = decode_smiles(self.model, x)
+        # Score molecules: completion (rollout), tweedie (1 forward), or current (as-is)
+        rollout_fp = 0
+        if self.scoring_mode == "tweedie":
+            scored_x, rollout_fp = self._tweedie_x0(x)
+        elif self.scoring_mode == "completion":
+            # Deterministic rollout for consistent scoring —
+            # main loop keeps normal randomness for diversity
+            scored_x, rollout_fp = self._rollout(x, step, num_steps,
+                                                 softmax_temp, randomness=0)
+        else:  # "current"
+            scored_x = x
+        smiles = decode_smiles(self.model, scored_x)
         rewards = self.forward_op(smiles)  # [K]
         rewards = rewards.to(x.device)
 
         best_r = rewards[rewards.isfinite()].max().item() if rewards.isfinite().any() else float("-inf")
+        rewards_list = rewards.tolist()
 
         # Clamp -inf to a large negative value for weight stability
         rewards = rewards.clamp(min=-100.0)
 
-        # delta_beta * r(x)
-        dt = 1.0 / num_steps
-        prev_beta = self._get_beta_t(max(step - 1, 0), num_steps)
+        # Accumulated delta_beta since last scoring step
+        if last_scored_step is not None:
+            prev_beta = self._get_beta_t(last_scored_step, num_steps)
+        else:
+            prev_beta = self._get_beta_t(max(step - 1, 0), num_steps)
         d_beta = beta_t - prev_beta
         g = d_beta * rewards
-        return g, len(smiles), best_r
+
+        if self.verbose:
+            n_valid = sum(1 for s in smiles if s)
+            print(f"    score step {step}/{num_steps}: d_beta={d_beta:.4f} "
+                  f"valid={n_valid}/{len(smiles)} best_r={best_r:.4f} "
+                  f"rollout_fp={rollout_fp}")
+
+        return g, len(smiles), best_r, smiles, rewards_list, rollout_fp
+
+    def _encode_and_remask(self, smiles_list, min_add_len=40):
+        """Encode SMILES back to token sequences and partially re-mask.
+
+        Used for elite seeding: take known good molecules, re-mask a fraction
+        of their tokens, and use as warm-start particles.
+        Returns token tensor [N, seq_len] or None if encoding fails.
+        """
+        import safe as sf
+        from genmol.utils.utils_chem import safe_to_smiles
+        from genmol.utils.bracket_safe_converter import BracketSAFEConverter, bracketsafe2safe
+
+        encoded = []
+        for smi in smiles_list:
+            try:
+                if self.model.config.training.get("use_bracket_safe"):
+                    safe_str = BracketSAFEConverter(slicer=self.slicer).encoder(smi, allow_empty=True)
+                else:
+                    safe_str = sf.SAFEConverter(slicer=self.slicer, ignore_stereo=True).encoder(smi, allow_empty=True)
+                ids = self.model.tokenizer(
+                    [safe_str], return_tensors='pt', truncation=True,
+                    max_length=self.model.config.model.max_position_embeddings
+                )['input_ids'][0]
+                encoded.append(ids)
+            except Exception:
+                continue
+
+        if not encoded:
+            return None
+
+        # Pad to same length
+        max_len = max(len(e) for e in encoded)
+        max_len = max(max_len, min_add_len + 2)
+        padded = []
+        for ids in encoded:
+            pad_len = max_len - len(ids)
+            if pad_len > 0:
+                ids = torch.cat([ids, torch.full((pad_len,), self.pad_index)])
+            padded.append(ids)
+        x = torch.stack(padded)
+
+        # Randomly mask a fraction of non-special tokens
+        for i in range(x.shape[0]):
+            # Find maskable positions (not BOS, EOS, PAD)
+            maskable = (
+                (x[i] != self.model.bos_index) &
+                (x[i] != self.model.eos_index) &
+                (x[i] != self.pad_index) &
+                (x[i] != self.model.mask_index)
+            )
+            mask_positions = maskable.nonzero(as_tuple=True)[0]
+            if len(mask_positions) == 0:
+                continue
+            n_mask = max(1, int(len(mask_positions) * self.elite_mask_ratio))
+            chosen = mask_positions[torch.randperm(len(mask_positions))[:n_mask]]
+            x[i, chosen] = self.model.mask_index
+
+        return x
 
     def _resample(self, x, log_weights):
         """Resample particles and reset weights."""
@@ -199,7 +335,8 @@ class DFKCSampler(Sampler):
 
     @torch.no_grad()
     def de_novo_generation(self, num_samples=1, softmax_temp=0.8,
-                           randomness=0.5, min_add_len=40, **kwargs):
+                           randomness=0.5, min_add_len=40, timeout_sec=None,
+                           max_reward_evals=None, **kwargs):
         K = self.num_particles
         device = self.model.device
         n_rounds = math.ceil(num_samples / K)
@@ -210,44 +347,117 @@ class DFKCSampler(Sampler):
         all_weights = []
         total_fp = 0
         total_reward_evals = 0
+        elite_buffer = []  # list of (score, smiles) sorted desc
+        t0 = time()
 
-        for _ in range(n_rounds):
-            # Initialize K particles from fully masked sequences
+        for rnd in range(n_rounds):
+            if timeout_sec is not None and time() - t0 > timeout_sec:
+                break
+            if max_reward_evals is not None and total_reward_evals >= max_reward_evals:
+                break
+            # Initialize K particles: some from elite buffer, rest from scratch
+            n_elite = 0
+            elite_x = None
+            if self.elite_ratio > 0 and elite_buffer:
+                n_elite = min(int(K * self.elite_ratio), len(elite_buffer))
+                elite_smiles = [smi for _, smi in elite_buffer[:n_elite]]
+                elite_x = self._encode_and_remask(elite_smiles, min_add_len)
+                if elite_x is not None:
+                    n_elite = elite_x.shape[0]
+                else:
+                    n_elite = 0
+
+            n_fresh = K - n_elite
             x_proto = torch.hstack([
                 torch.full((1, 1), self.model.bos_index),
                 torch.full((1, 1), self.model.eos_index),
             ])
-            x = self._insert_mask(x_proto, K, min_add_len=min_add_len)
+            x_fresh = self._insert_mask(x_proto, n_fresh, min_add_len=min_add_len)
+
+            if n_elite > 0 and elite_x is not None:
+                # Pad to same seq length and concatenate
+                max_len = max(x_fresh.shape[1], elite_x.shape[1])
+                if x_fresh.shape[1] < max_len:
+                    x_fresh = torch.cat([x_fresh, torch.full(
+                        (x_fresh.shape[0], max_len - x_fresh.shape[1]), self.pad_index)], dim=1)
+                if elite_x.shape[1] < max_len:
+                    elite_x = torch.cat([elite_x, torch.full(
+                        (elite_x.shape[0], max_len - elite_x.shape[1]), self.pad_index)], dim=1)
+                x = torch.cat([elite_x, x_fresh], dim=0)
+            else:
+                x = x_fresh
             x = x.to(device)
 
             num_steps = max(self.mdlm.get_num_steps_confidence(x), 2)
             log_weights = torch.zeros(K, device=device)
+            last_scored_step = 0  # accumulate d_beta from step 0
 
             for i in range(num_steps):
+                if max_reward_evals is not None and total_reward_evals >= max_reward_evals:
+                    break
                 beta_t = self._get_beta_t(i, num_steps)
+                progress = i / num_steps
 
                 # Forward pass
                 attention_mask = (x != self.pad_index)
                 logits = self.model(x, attention_mask)  # [K, seq, V]
                 total_fp += K
 
-                # Weight update (before modifying logits)
+                # Should we call the oracle this step?
+                # Use denser scoring in late phase if score_interval_late is set
+                interval = self.score_interval
+                if self.score_interval_late is not None and progress >= self.late_phase:
+                    interval = self.score_interval_late
+                should_score = (
+                    self.mode == "reward"
+                    and self.forward_op is not None
+                    and progress >= self.score_start
+                    and i % interval == 0
+                )
+
+                # ── Weight update ──────────────────────────────
                 if self.mode == "annealing":
                     log_weights += self._annealing_weight_increment(
                         logits, x, i, num_steps, beta_t)
                     self._log_point(0, K, float("-inf"))
-                elif self.mode == "reward":
-                    g, n_evals, best_r = self._reward_weight_increment(
-                        x, i, num_steps, beta_t)
-                    log_weights += g
-                    total_reward_evals += n_evals
-                    self._log_point(n_evals, K, best_r)
 
-                # Modified state update
+                elif self.mode == "reward" and should_score:
+                    g, n_evals, best_r, smiles_batch, scores_batch, rfp = \
+                        self._reward_weight_increment(
+                            x, i, num_steps, beta_t, last_scored_step,
+                            softmax_temp, randomness)
+                    if self.fresh_weight:
+                        raw_rewards = torch.tensor(scores_batch, device=device)
+                        raw_rewards = raw_rewards.clamp(min=-100.0)
+                        log_weights = beta_t * raw_rewards
+                    else:
+                        log_weights += g
+                    total_reward_evals += n_evals
+                    total_fp += rfp
+                    last_scored_step = i
+                    self._log_point(n_evals, K, best_r,
+                                    smiles_batch=smiles_batch,
+                                    scores_batch=scores_batch)
+                    # Update elite buffer
+                    if self.elite_ratio > 0:
+                        for smi, sc in zip(smiles_batch, scores_batch):
+                            if smi and sc > -99:
+                                elite_buffer.append((sc, smi))
+                        elite_buffer.sort(reverse=True)
+                        # Deduplicate, keep top N
+                        seen_elite = set()
+                        deduped = []
+                        for sc, smi in elite_buffer:
+                            if smi not in seen_elite:
+                                seen_elite.add(smi)
+                                deduped.append((sc, smi))
+                            if len(deduped) >= self.elite_buffer_size:
+                                break
+                        elite_buffer = deduped
+
+                # ── Modified logits for denoising step ─────────
                 if self.mode == "annealing":
                     modified_logits = logits * beta_t
-                elif self.mode == "reward" and self.forward_op is not None:
-                    modified_logits = logits  # reward guidance via weights only
                 else:
                     modified_logits = logits
 
@@ -262,6 +472,7 @@ class DFKCSampler(Sampler):
                 ess = compute_ess(log_weights)
                 if ess < self.ess_threshold * K:
                     x, log_weights = self._resample(x, log_weights)
+                    last_scored_step = i  # accumulate from resample point
                     if self.verbose:
                         print(f"  step {i}/{num_steps}: ESS={ess:.1f}, resampled")
 
@@ -302,7 +513,7 @@ class SMCSampler(Sampler):
 
     def __init__(
         self,
-        path,
+        path=None,
         forward_op=None,
         num_particles=8,
         resample_interval=5,
@@ -312,9 +523,10 @@ class SMCSampler(Sampler):
         resample_strategy="systematic",
         seed=None,
         verbose=False,
+        model=None,
         **kwargs,
     ):
-        super().__init__(path, forward_op=forward_op, **kwargs)
+        super().__init__(path=path, forward_op=forward_op, model=model, **kwargs)
         self.forward_op = forward_op
         self.num_particles = max(int(num_particles), 2)
         self.resample_interval = max(int(resample_interval), 1)
@@ -329,7 +541,8 @@ class SMCSampler(Sampler):
 
     @torch.no_grad()
     def de_novo_generation(self, num_samples=1, softmax_temp=0.8,
-                           randomness=0.5, min_add_len=40, **kwargs):
+                           randomness=0.5, min_add_len=40, timeout_sec=None,
+                           max_reward_evals=None, **kwargs):
         K = self.num_particles
         device = self.model.device
         n_rounds = math.ceil(num_samples / K)
@@ -341,8 +554,13 @@ class SMCSampler(Sampler):
         all_rewards = []
         total_fp = 0
         total_reward_evals = 0
+        t0 = time()
 
         for _ in range(n_rounds):
+            if timeout_sec is not None and time() - t0 > timeout_sec:
+                break
+            if max_reward_evals is not None and total_reward_evals >= max_reward_evals:
+                break
             # Initialize K particles
             x_proto = torch.hstack([
                 torch.full((1, 1), self.model.bos_index),
@@ -354,6 +572,8 @@ class SMCSampler(Sampler):
             num_steps = max(self.mdlm.get_num_steps_confidence(x), 2)
 
             for i in range(num_steps):
+                if max_reward_evals is not None and total_reward_evals >= max_reward_evals:
+                    break
                 # Standard forward pass + denoising
                 attention_mask = (x != self.pad_index)
                 logits = self.model(x, attention_mask)
@@ -373,7 +593,8 @@ class SMCSampler(Sampler):
                     total_reward_evals += K
 
                     best_r = rewards[rewards.isfinite()].max().item() if rewards.isfinite().any() else float("-inf")
-                    self._log_point(K, total_fp - last_logged_fp, best_r)
+                    self._log_point(K, total_fp - last_logged_fp, best_r,
+                                    smiles_batch=smiles, scores_batch=rewards.tolist())
                     last_logged_fp = total_fp
 
                     # Replace -inf with minimum finite reward
@@ -398,11 +619,19 @@ class SMCSampler(Sampler):
 
             # Collect results
             smiles = decode_smiles(self.model, x)
-            if self.forward_op is not None:
+            # Skip end-of-round scoring if budget exhausted -- particles
+            # were already scored at the last in-loop resample, and another
+            # K calls here would overshoot the configured budget.
+            budget_exhausted = (
+                max_reward_evals is not None
+                and total_reward_evals >= max_reward_evals
+            )
+            if self.forward_op is not None and not budget_exhausted:
                 rewards = self.forward_op(smiles).to(device)
                 total_reward_evals += K
                 best_r = rewards[rewards.isfinite()].max().item() if rewards.isfinite().any() else float("-inf")
-                self._log_point(K, total_fp - last_logged_fp, best_r)
+                self._log_point(K, total_fp - last_logged_fp, best_r,
+                                smiles_batch=smiles, scores_batch=rewards.tolist())
                 last_logged_fp = total_fp
             else:
                 rewards = torch.zeros(K, device=device)

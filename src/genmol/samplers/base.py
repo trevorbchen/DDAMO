@@ -31,7 +31,39 @@ from genmol.utils.bracket_safe_converter import BracketSAFEConverter, bracketsaf
 from genmol.model import GenMol
 
 
-ROOT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))))
+
+
+def _tanimoto_diversity(smiles_list, max_pairs=5000):
+    """Average pairwise Tanimoto distance for a list of SMILES.
+
+    Returns a float in [0, 1] where 1 = maximally diverse.
+    Subsamples pairs if the list is large to keep runtime bounded.
+    """
+    from rdkit.Chem import AllChem, DataStructs
+    fps = []
+    for smi in smiles_list:
+        mol = Chem.MolFromSmiles(smi) if smi else None
+        if mol is not None:
+            fps.append(AllChem.GetMorganFingerprintAsBitVect(mol, 2, nBits=2048))
+    if len(fps) < 2:
+        return 0.0
+    n = len(fps)
+    if n * (n - 1) // 2 <= max_pairs:
+        total_sim = 0.0
+        count = 0
+        for i in range(n):
+            sims = DataStructs.BulkTanimotoSimilarity(fps[i], fps[i + 1:])
+            total_sim += sum(sims)
+            count += len(sims)
+    else:
+        import random as _rng
+        total_sim = 0.0
+        count = max_pairs
+        for _ in range(max_pairs):
+            i, j = _rng.sample(range(n), 2)
+            total_sim += DataStructs.TanimotoSimilarity(fps[i], fps[j])
+    return 1.0 - total_sim / count if count > 0 else 0.0
 
 
 def load_model_from_path(path):
@@ -79,7 +111,20 @@ class Sampler:
         self._cumul_reward_calls = 0
         self._cumul_forward_passes = 0
         self._best_reward = float("-inf")
-        
+
+    @torch.no_grad()
+    def _tweedie_x0(self, x):
+        """One-shot Tweedie estimate of x0 from xt.
+        Single forward pass; fill every masked position with argmax over vocab.
+        Returns (pseudo_clean_tensor, fp_count)."""
+        attention_mask = x != self.pad_index
+        logits = self.model(x, attention_mask)
+        pseudo_x0 = x.clone()
+        mask_positions = (x == self.model.mask_index)
+        if mask_positions.any():
+            pseudo_x0[mask_positions] = logits[mask_positions].argmax(-1)
+        return pseudo_x0, x.shape[0]
+
     @torch.no_grad()
     def generate(self, x, softmax_temp=1.2, randomness=2, fix=True, gamma=0, w=2, **kwargs):
         x = x.to(self.model.device)
@@ -135,34 +180,142 @@ class Sampler:
 
     def _reset_trajectory(self):
         """Call at the start of de_novo_generation to reset tracking state."""
+        from time import time
         self._trajectory = []
         self._cumul_reward_calls = 0
         self._cumul_forward_passes = 0
         self._best_reward = float("-inf")
+        self._round_id = 0
+        self._t0 = time()
+        self._scored_pool = []  # list of (smiles, score)
+        self._unique_smiles = set()
+        self._snapshot_hours = set()
+        self._snapshots = {}
+        self._last_logged_calls = 0  # for 10-call interval logging
+        # Oracle-call milestones: set via sampler.snapshot_call_milestones
+        # before calling de_novo_generation
+        if not hasattr(self, 'snapshot_call_milestones'):
+            self.snapshot_call_milestones = set()
+        self._snapshot_calls_done = set()
 
-    def _log_point(self, reward_calls_delta, fp_delta, best_reward_this_batch):
-        """Record one trajectory checkpoint with delta-based accumulation."""
+    def _log_point(self, reward_calls_delta, fp_delta, best_reward_this_batch,
+                   smiles_batch=None, scores_batch=None, **extras):
+        """Record trajectory data. Emits a row every 10 cumulative oracle calls.
+
+        extras: method-specific fields (candidates_kept, cum_simulations, etc.)
+        """
+        from time import time
         self._cumul_reward_calls += reward_calls_delta
         self._cumul_forward_passes += fp_delta
         self._best_reward = max(self._best_reward, best_reward_this_batch)
-        self._trajectory.append({
-            "reward_calls": self._cumul_reward_calls,
-            "forward_passes": self._cumul_forward_passes,
-            "best_reward": self._best_reward,
-        })
+        wall = time() - self._t0 if hasattr(self, '_t0') else 0.0
+
+        # Track scored molecules for running metrics + snapshots
+        if smiles_batch is not None and scores_batch is not None:
+            for smi, sc in zip(smiles_batch, scores_batch):
+                if smi and sc is not None:
+                    self._scored_pool.append((sc, smi))
+                    self._unique_smiles.add(smi)
+
+        # Emit trajectory row every 10 oracle calls
+        if self._cumul_reward_calls - self._last_logged_calls >= 10:
+            self._last_logged_calls = (self._cumul_reward_calls // 10) * 10
+            self._round_id += 1
+
+            # Compute running metrics from scored pool
+            if self._scored_pool:
+                all_scores = sorted([sc for sc, _ in self._scored_pool], reverse=True)
+                n = len(all_scores)
+                top10_mean = sum(all_scores[:max(1, n // 10)]) / max(1, n // 10)
+                top1_mean = sum(all_scores[:max(1, n // 100)]) / max(1, n // 100)
+            else:
+                top10_mean = 0.0
+                top1_mean = 0.0
+
+            row = {
+                "wall_sec": wall,
+                "round_id": self._round_id,
+                "cum_oracle_calls": self._cumul_reward_calls,
+                "cum_forward": self._cumul_forward_passes,
+                "running_best": self._best_reward,
+                "top10_mean": top10_mean,
+                "top1_mean": top1_mean,
+                "cum_unique_molecules": len(self._unique_smiles),
+            }
+            row.update(extras)
+            self._trajectory.append(row)
+            print(f"  [{self.__class__.__name__}] {wall:.0f}s  oracle={self._cumul_reward_calls}  "
+                  f"best={self._best_reward:.4f}  top10={top10_mean:.4f}  "
+                  f"unique={len(self._unique_smiles)}", flush=True)
+
+        # Hourly snapshots
+        elapsed_hr = int(wall / 3600)
+        if elapsed_hr > 0 and elapsed_hr not in self._snapshot_hours:
+            self._snapshot_hours.add(elapsed_hr)
+            self._snapshots[f"{elapsed_hr}hr"] = self._build_snapshot()
+
+        # Oracle-call-based snapshots
+        for milestone in self.snapshot_call_milestones:
+            if (milestone not in self._snapshot_calls_done
+                    and self._cumul_reward_calls >= milestone):
+                self._snapshot_calls_done.add(milestone)
+                self._snapshots[f"{milestone}calls"] = self._build_snapshot()
+
+    def _build_snapshot(self):
+        """Build a snapshot dict from the current scored pool."""
+        from time import time
+        pool_sorted = sorted(self._scored_pool, reverse=True)
+        seen = set()
+        unique = []
+        for sc, smi in pool_sorted:
+            if smi not in seen:
+                seen.add(smi)
+                unique.append({"smiles": smi, "score": sc})
+        wall = time() - self._t0 if hasattr(self, '_t0') else 0.0
+        all_scores = [d["score"] for d in unique]
+        n = len(all_scores)
+        top10_n = max(1, n // 10)
+        snapshot = {
+            "molecules": unique,
+            "best_FA": all_scores[0] if all_scores else None,
+            "top10_mean_FA": sum(all_scores[:10]) / min(10, n) if n else None,
+            "top10pct_mean_FA": sum(all_scores[:top10_n]) / top10_n if n else None,
+            "unique_molecule_count": n,
+            "cum_oracle_calls": self._cumul_reward_calls,
+            "wall_sec": wall,
+            "tanimoto_diversity": _tanimoto_diversity([d["smiles"] for d in unique[:200]]),
+        }
+        return snapshot
 
     @property
     def trajectory(self):
         return list(self._trajectory)
 
+    @property
+    def snapshots(self):
+        return dict(self._snapshots)
+
     @torch.no_grad()
-    def de_novo_generation(self, num_samples=1, softmax_temp=0.8, randomness=0.5, min_add_len=40, **kwargs):
-        # Prepare Fully Masked Inputs
-        x = torch.hstack([torch.full((1, 1), self.model.bos_index),
-                          torch.full((1, 1), self.model.eos_index)])
-        x = self._insert_mask(x, num_samples, min_add_len=min_add_len)
-        x = x.to(self.model.device)
-        return self.generate(x, softmax_temp, randomness)
+    def de_novo_generation(self, num_samples=1, softmax_temp=0.8, randomness=0.5, min_add_len=40, timeout_sec=None, **kwargs):
+        from time import time
+        BATCH_SIZE = 256
+        t0 = time()
+        all_smiles = []
+        remaining = num_samples
+        while remaining > 0:
+            if timeout_sec is not None and time() - t0 > timeout_sec:
+                break
+            bs = min(remaining, BATCH_SIZE)
+            x = torch.hstack([torch.full((1, 1), self.model.bos_index),
+                              torch.full((1, 1), self.model.eos_index)])
+            x = self._insert_mask(x, bs, min_add_len=min_add_len)
+            x = x.to(self.model.device)
+            batch_smiles = self.generate(x, softmax_temp, randomness)
+            all_smiles.extend(batch_smiles)
+            remaining -= bs
+            if len(all_smiles) % 1024 < BATCH_SIZE:
+                print(f"  [baseline] {time()-t0:.0f}s  n={len(all_smiles)}", flush=True)
+        return all_smiles
     
     def fragment_linking_onestep(self, fragment, num_samples=1, softmax_temp=1.2, randomness=2, gamma=0, min_add_len=30, **kwargs):
         if self.model.config.training.get('use_bracket_safe'):

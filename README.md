@@ -7,7 +7,7 @@ We benchmark inference-time search and test-time fine-tuning strategies built on
 
 ![Overview](overview.jpg)
 
-The headline finding is that online fine-tuning (DDPP-LB + CVaR reward shaping + Thompson exploration via ensemble surrogate + replay buffer + invalid-SMILES penalty) dominates all pure inference-time search strategies under a fixed GPU-hour budget.
+The headline finding is that online fine-tuning (DDPP-LB + CVaR reward shaping + Thompson exploration via ensemble surrogate + replay buffer + invalid-SMILES penalty) dominates all pure inference-time search strategies under a fixed GPU-hour budget. We evaluate across six small-molecule binding affinity targets (2VT4, 5SDV, 6CM4, 7BKC, 7C7M, 7YLL) and three protein fitness optimization tasks.
 
 ---
 
@@ -99,6 +99,21 @@ python scripts/run_beam_fa.py --model_path model_v2.ckpt --gpu 0
 python scripts/run_uncond_fa.py --model_path model_v2.ckpt --gpu 0
 ```
 
+### Protein fitness optimization
+
+The same scripts support protein tasks via the `--protein_pdb` and `--protein_id` flags:
+
+```bash
+python scripts/run_active_loop.py \
+    --model_path model_v2.ckpt \
+    --protein_pdb FlashAffinity/data/protein_test/pdb/<TARGET>.pdb \
+    --protein_id <TARGET> \
+    --n_epochs 20 --M 500 --K 25 --tau_mode cvar \
+    --output_dir outputs/<TARGET>_active_loop
+```
+
+Replace `<TARGET>` with the PDB ID for each protein task. Small-molecule targets (2VT4, 5SDV, 6CM4, 7BKC, 7C7M, 7YLL) use the same interface without specifying a PDB.
+
 ### Reproducing ablation figures
 
 ```bash
@@ -149,12 +164,6 @@ python scripts/plot_fig9_compute.py       # compute-efficiency analysis
 ├── env/                     # requirements.txt and setup scripts
 └── docs/                    # Paper drafting context and method write-ups
 ```
-
----
-
-## Results
-
-Experimental results (oracle timelines, scored molecule CSVs) for all runs across ~200 experimental configurations are available on [HuggingFace](https://huggingface.co/trevorbchen/DDAMO).
 
 ---
 

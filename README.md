@@ -3,7 +3,7 @@
 Code for the paper **"On the Design Space of Discrete Diffusion Online
 Adaptation for Molecular Optimization"**.
 
-We benchmark inference-time search and test-time fine-tuning strategies built on top of [GenMol](https://github.com/arielyyd/genmol), a masked discrete-diffusion model over SAFE molecular representations. The oracle throughout is [FlashAffinity](https://github.com/BIMSBbioinfo/FlashAffinity) (FA), a fast binary-head binding classifier, evaluated across six protein pockets.
+We benchmark inference-time search and test-time fine-tuning strategies built on top of [GenMol](https://github.com/NVIDIA-BioNeMo/genmol), a masked discrete-diffusion model over SAFE molecular representations. The oracle throughout is [FlashAffinity](https://github.com/AIDD-Lab/FlashBind) (FA), a fast binary-head binding classifier, evaluated across six protein pockets.
 
 ![Overview](overview.jpg)
 

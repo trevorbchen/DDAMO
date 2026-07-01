@@ -7,7 +7,7 @@ We benchmark inference-time search and test-time fine-tuning strategies built on
 
 ![Overview](overview.jpg)
 
-The headline finding is that online fine-tuning (DDPP-LB + CVaR reward shaping + Thompson exploration via ensemble surrogate + replay buffer + invalid-SMILES penalty) dominates all pure inference-time search strategies under a fixed GPU-hour budget. We evaluate across six small-molecule binding affinity targets (2VT4, 5SDV, 6CM4, 7BKC, 7C7M, 7YLL) and three protein fitness optimization tasks.
+The main finding is that there are various additions to pure fine-tuning (DDPP-LB + CVaR reward shaping + Thompson exploration via ensemble surrogate + replay buffer + invalid-SMILES penalty) that increase the efficiency of search strategies under a fixed GPU-hour budget. We evaluate across six small-molecule binding affinity targets (2VT4, 5SDV, 6CM4, 7BKC, 7C7M, 7YLL) and three protein fitness optimization tasks.
 
 ---
 

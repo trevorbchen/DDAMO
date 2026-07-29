@@ -171,4 +171,4 @@ python scripts/plot_fig9_compute.py       # compute-efficiency analysis
 
 MIT License. See [LICENSE](LICENSE).
 
-The pretrained GenMol checkpoint (`model_v2.ckpt`) is released by the original authors under their own license; see [arielyyd/genmol](https://github.com/arielyyd/genmol).
+The pretrained GenMol checkpoint (`model_v2.ckpt`) is released by the original authors under their own license; see [genmol](https://github.com/NVIDIA-BioNeMo/genmol).
